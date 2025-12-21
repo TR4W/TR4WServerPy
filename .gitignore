@@ -1,0 +1,5 @@
+# Generated files
+SERVERLOG.TRW
+tr4wserver.ini
+*.pyc
+__pycache__/
