@@ -1,0 +1,22 @@
+[Unit]
+Description=TR4WSERVER - Ham Radio Logging Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/tr4wserver
+ExecStart=/usr/bin/python3 /home/pi/tr4wserver/tr4wserver.py
+Restart=always
+RestartSec=5
+
+# Give the server time to clean up
+TimeoutStopSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tr4wserver
+
+[Install]
+WantedBy=multi-user.target
