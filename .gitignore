@@ -3,3 +3,6 @@ SERVERLOG.TRW
 tr4wserver.ini
 *.pyc
 __pycache__/
+
+# Claude Code session/settings (per-developer, not part of the project)
+.claude/
