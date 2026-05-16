@@ -78,7 +78,10 @@ All sizes below are derived from the current `VC.pas` and `tr4wserver.cfg`, trea
 ## Things to be careful with
 
 - **Sizes are derived, not invented.** Every entry in the `MESSAGE_SIZES` table maps to a concrete record in `VC.pas`. If you change one, comment the `VC.pas` line you reconciled against. Don't add fudge factors to make a number "feel right."
-- **`ContestExchange` is not `packed`**, so `{$A8}` alignment matters. Field offsets within it (used by `update_qso_in_log` to find `ceQSOID1`/`ceQSOID2`) are `tSysTime`(0..5) + `Band`(6) + `Mode`(7) + `ceQSOID1`(8..11) + `ceQSOID2`(12..15). Those four fields are tightly packed because `ceQSOID1` lands on a natural 4-byte boundary; do not assume the same kind of "no padding" elsewhere in the record.
+- **`ContestExchange` is not `packed`**, so `{$A8}` alignment matters. Field offsets within it (used by `update_qso_in_log` to find `ceQSOID1`/`ceQSOID2`, and by `_scan_log_for_serials` to find `NumberSent`) are:
+   - `tSysTime`(0..5) + `Band`(6) + `Mode`(7) + `ceQSOID1`(8..11) + `ceQSOID2`(12..15) — tightly packed because `ceQSOID1` lands on a natural 4-byte boundary;
+   - `NumberSent`(204..207) — the `CE_NUMBER_SENT_OFFSET` constant. A walk of every preceding field is documented in the constant's comment; any TR4W release that adds or reorders fields **before** `NumberSent` shifts this and must be re-derived.
+  Do not assume the same kind of "no padding" elsewhere in the record.
 - **All multi-byte fields are little-endian** (`<` in `struct` format strings). Delphi on x86 produces little-endian packed records; do not switch to network byte order anywhere.
 - **Bare `except:` clauses are widespread** (especially around socket sends and file I/O). They mirror the original Delphi swallow-and-continue behavior so one dead client doesn't kill broadcasts. Don't tighten these without thinking about which exceptions you actually want to surface — but new code should prefer narrow `except OSError:` over bare except.
 - **No graceful shutdown of the accept threads.** `stop()` closes the sockets, which raises in `accept()`; the daemon threads then exit when the process does. This is fine for the systemd `Restart=always` model but means there's no clean unit-test teardown story.

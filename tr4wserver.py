@@ -21,6 +21,7 @@ import sys
 import time
 import zlib
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
@@ -135,6 +136,34 @@ def _cstring(buf: bytes) -> str:
     return buf.decode('ascii', errors='replace').rstrip()
 
 
+def _enable_vt_processing() -> bool:
+    """Enable ANSI VT processing on Windows stdout so escape sequences are
+    interpreted as cursor controls instead of silently dropped.
+
+    Returns True if ANSI can be used (non-Windows always returns True;
+    Windows returns True only if SetConsoleMode succeeded). When it
+    returns False the caller should fall back to a `cls`-style clear."""
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # STD_OUTPUT_HANDLE = -11
+        handle = kernel32.GetStdHandle(-11)
+        if handle in (0, -1, None):
+            return False
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        new_mode = mode.value | 0x0004
+        if not kernel32.SetConsoleMode(handle, new_mode):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _safe_sendall(sock: socket.socket, data: bytes) -> bool:
     """sendall with the dead-client errors swallowed.
 
@@ -231,6 +260,48 @@ STATUS_BIT_SP_MODE      = 1 << 1
 STATUS_BIT_DUPE         = 1 << 2
 STATUS_BIT_PTT_LOCKOUT  = 1 << 3
 
+# TSerialNumberType (VC.pas / tr4wserverUnit.pas:417). Values travel in the
+# smParam field of NET_SERVERMESSAGE_ID packets with smMessage = SM_SERIAL_NUMBER_CHANGED.
+SNT_FREE     = 0
+SNT_RESERVED = 1
+SNT_UNKNOWN  = 2
+
+# Byte offset of the NumberSent field within ContestExchange. Derived by
+# walking the record fields in VC.pas:1517 under {$A8} alignment:
+#   tSysTime[0..5] + Band[6] + Mode[7] + ceQSOID1[8..11] + ceQSOID2[12..15]
+#   + Frequency[16..19] + 8 bool/byte fields[20..27]
+#   + PostalCode_old[28..34] + ZERO_01[35]
+#   + Prefix[36..42] + ZERO_02[43]
+#   + Callsign[44..57] + Age[58] + ceWasSendInQTC[59]
+#   + 4 mult bools[60..63] + ExtMode[64] + ExchString[65..105]
+#   + ceClass[106..109] + 4 bytes[110..113]
+#   + QTH[114..145] + DXQTH[146..151] + ZERO_05[152] + Radio[153]
+#   + DomMultQTH[154..164] + ZERO_06[165]
+#   + DomesticQTH[166..176] + ZERO_07[177]
+#   + Name[178..188] + ZERO_08[189]
+#   + Power[190..196] + ZERO_09[197]
+#   + 2 bytes padding to 4-byte alignment[198..199]
+#   + NumberReceived[200..203]
+#   + NumberSent[204..207]   <-- this offset
+# If a future TR4W release adds/reorders fields before NumberSent, update both
+# this constant and LOG RECORD SIZE.
+CE_NUMBER_SENT_OFFSET = 204
+
+# Byte offset of ceContest within ContestExchange. Continuing the field walk
+# from NumberSent: + RSTSent[208..209] + RSTReceived[210..211]
+# + QTHString[212..222] + ZERO_10[223] + RandomCharsSent[224..229]
+# + TenTenNum[230..231] + Chapter[232..236] + ZERO_11[237]
+# + 4 bool/byte fields[238..241] + Zone[242] + NameSent[243]
+# + Kids[244..264] + ceContest[265]. One byte; ContestType enum under {$Z1}.
+CE_CONTEST_OFFSET = 265
+
+# ContestExchange field offsets used by the "last QSO" display line. See the
+# CE_NUMBER_SENT_OFFSET comment above for the full prefix walk.
+CE_BAND_OFFSET     = 6      # BandType (1 byte enum)
+CE_MODE_OFFSET     = 7      # ModeType (1 byte enum)
+CE_FREQ_OFFSET     = 16     # Frequency, signed Int32 LE
+CE_CALLSIGN_OFFSET = 44     # Pascal string[13] — 1 length byte + up to 13 chars
+
 # Display strings for the BandType / ModeType enums. Index = enum value.
 # Mirrors VC.pas:1275 (BandStringsArrayWithOutSpaces) and VC.pas:1239
 # (ModeStringArray). Update if BandType in VC.pas gains entries — order is
@@ -290,6 +361,20 @@ class TR4WServer:
         self.log_record_size = DEFAULT_LOG_RECORD_SIZE
         self.trace_rx = False  # set by --trace-rx; dumps raw recvs + frames
 
+        # Serial-number lockout state. next_serial is the SHARED counter that
+        # the Delphi server keeps mirrored across all 26 per-client slots;
+        # the observable behavior is identical, the per-client storage is
+        # an artifact of the Delphi struct layout we don't need to replicate.
+        # Guarded by clients_lock since every mutation also reads/touches
+        # the client list.
+        self.next_serial = 1
+
+        # Last QSO that flowed through the server (any of QSOINFO / OFFLINEQSO
+        # / EDITEDQSO). dict with keys: when, call, band, mode, freq, sender,
+        # action. None until first QSO is seen. Replaced atomically — reads
+        # don't need a lock.
+        self.last_qso: Optional[Dict] = None
+
         self.clients: Dict[socket.socket, ClientEntry] = {}
         self.clients_lock = threading.Lock()
 
@@ -316,6 +401,10 @@ class TR4WServer:
         # Built after config so the QSO message size tracks log_record_size.
         self.message_sizes = _build_message_sizes(self.log_record_size)
         self.init_log_file()
+        # Seed next_serial from the on-disk log. Matches Delphi's
+        # ScanLogForSerialsNumbers call from tr4wserver.dpr:96.
+        if self.serial_number_lockout:
+            self._scan_log_for_serials()
 
     def load_config(self):
         """Load configuration from INI file. Bad INI ⇒ log + use defaults
@@ -597,6 +686,10 @@ class TR4WServer:
 
             logger.info(f"Client connected: {addr[0]} ({hostname}) - Total: {total}")
             self.send_log_file_info(client_socket)
+            # Mirrors tr4wserver.dpr:421-422: after sending the log info,
+            # push the current next-serial to all free clients (which always
+            # includes the one we just registered).
+            self._send_serial_numbers_changed()
             self.handle_client(client_socket)
 
         except _DEAD_CLIENT_ERRORS as e:
@@ -808,19 +901,19 @@ class TR4WServer:
 
             elif msg_id == NET_EDITEDQSO_ID:
                 self.broadcast_to_clients(client_socket, data, include_sender=False)
-                # Update QSO in server log
                 self.update_qso_in_log(data)
+                self._record_last_qso(client_socket, data, 'edit')
                 self.send_confirm_message(client_socket)
 
             elif msg_id == NET_OFFLINEQSO_ID:
-                # Add offline QSO to log
                 self.add_qso_to_log(data)
+                self._record_last_qso(client_socket, data, 'offline')
                 self.send_confirm_message(client_socket)
 
             elif msg_id == NET_QSOINFO_ID:
                 self.broadcast_to_clients(client_socket, data, include_sender=False)
-                # Add QSO to log
                 self.add_qso_to_log(data)
+                self._record_last_qso(client_socket, data, 'new')
 
             elif msg_id == NET_CLIENTSTATUS_ID:
                 self.update_client_status(client_socket, data)
@@ -872,13 +965,23 @@ class TR4WServer:
             self.bytes_sent += SIZE_OF_LOG_FILE_INFORMATION
 
     def get_contest_type(self) -> int:
-        """Read ceContest from the first QSO in the log.
+        """Read ceContest from the first QSO in the log. Matches Delphi
+        SendLogFileInformation (tr4wserverUnit.pas:778-781) — empty log
+        returns DUMMYCONTEST, otherwise the ContestType byte from the
+        first record.
 
-        Field offset within ContestExchange: see VC.pas:1604 — ceContest sits
-        in the trailing tail of the record. Without parsing the whole record
-        layout we don't know the exact offset, so until that's wired we return
-        DUMMYCONTEST. The Delphi server reads TempCE.ceContest by Pascal field
-        access; replicating that here would require per-field accessors."""
+        Called from send_log_file_info on every client connect and on
+        every NET_LOGINFO_MESSAGE sentinel. One small read per call;
+        not cached because the log can grow between calls and we want
+        a freshly-inserted first QSO to be visible immediately."""
+        try:
+            with open(self.log_file_path, 'rb') as f:
+                f.seek(self.log_record_size)  # skip header
+                rec = f.read(self.log_record_size)
+            if len(rec) >= CE_CONTEST_OFFSET + 1:
+                return rec[CE_CONTEST_OFFSET]
+        except OSError as e:
+            logger.warning(f"get_contest_type: {e}")
         return DUMMYCONTEST
 
     def add_qso_to_log(self, data: bytes):
@@ -1019,6 +1122,128 @@ class TR4WServer:
             elif ss_type == SST_OPERATOR:
                 entry.operator = _cstring(data[35:46])
 
+    def _record_last_qso(self, sender: socket.socket, data: bytes, action: str):
+        """Snapshot the just-arrived QSO for the status display.
+
+        `data` is a TNetQSOInformation packet: 2-byte qiID followed by a
+        ContestExchange record. We pull just enough out of the CE to render
+        a one-line summary; the full record was already appended (or
+        overwritten) by the caller. Best-effort — if any field is malformed
+        we just don't update last_qso, the previous one stays visible."""
+        try:
+            ce = data[2:2 + self.log_record_size]
+            if len(ce) < CE_CONTEST_OFFSET:
+                return
+            band_idx = ce[CE_BAND_OFFSET]
+            mode_idx = ce[CE_MODE_OFFSET]
+            freq_hz  = struct.unpack_from('<i', ce, CE_FREQ_OFFSET)[0]
+            # Pascal string[13] at offset 44: length byte then chars.
+            call_len = min(ce[CE_CALLSIGN_OFFSET], 13)
+            call_bytes = ce[CE_CALLSIGN_OFFSET + 1 : CE_CALLSIGN_OFFSET + 1 + call_len]
+            callsign = call_bytes.decode('ascii', errors='replace').strip()
+        except (IndexError, struct.error):
+            return
+
+        with self.clients_lock:
+            entry = self.clients.get(sender)
+            sender_id = entry.computer_id if entry else '?'
+
+        band_str = BAND_NAMES[band_idx] if 0 <= band_idx < len(BAND_NAMES) else f"?{band_idx}"
+        mode_str = MODE_NAMES[mode_idx] if 0 <= mode_idx < len(MODE_NAMES) else f"?{mode_idx}"
+
+        # Atomic replace — readers (status display) always see either the
+        # previous dict or this one, never a half-written mix.
+        self.last_qso = {
+            'when':    datetime.now().strftime('%H:%M:%S'),
+            'call':    callsign,
+            'band':    band_str,
+            'mode':    mode_str,
+            'freq':    f"{freq_hz/1000:.2f}" if freq_hz else "",
+            'sender':  sender_id or '-',
+            'action':  action,   # 'new' | 'edit' | 'offline'
+        }
+
+    # ------------------------------------------------------------------
+    # Serial-number lockout (mirrors tr4wserverUnit.pas)
+    # ------------------------------------------------------------------
+
+    def _scan_log_for_serials(self):
+        """Walk SERVERLOG.TRW, find the max NumberSent across all records,
+        seed self.next_serial = max + 1. Equivalent to the Delphi
+        ScanLogForSerialsNumbers (tr4wserverUnit.pas:1084). No-op if the
+        log is empty or the field is unreadable for any reason — the
+        counter stays at its current value so we never go backwards."""
+        max_sent = 0
+        try:
+            with self.log_lock, open(self.log_file_path, 'rb') as f:
+                f.seek(self.log_record_size)  # skip the header record
+                while True:
+                    rec = f.read(self.log_record_size)
+                    if len(rec) < self.log_record_size:
+                        break
+                    n = struct.unpack_from(
+                        '<i', rec, CE_NUMBER_SENT_OFFSET
+                    )[0]
+                    if n > max_sent:
+                        max_sent = n
+        except OSError as e:
+            logger.warning(f"Serial-number scan failed: {e}; next_serial unchanged")
+            return
+        with self.clients_lock:
+            self.next_serial = max_sent + 1
+            # Reset every connected client's view to free; the next call to
+            # _send_serial_numbers_changed will broadcast the seeded value.
+            for entry in self.clients.values():
+                entry.serial_number_status = SNT_FREE
+                entry.serial_number = self.next_serial
+        logger.info(f"Serial-number scan: next_serial = {max_sent + 1}")
+        self._send_serial_numbers_changed()
+
+    def _send_serial_numbers_changed(self):
+        """Push the current next_serial to every connected client whose
+        status is SNT_FREE. Mirrors Delphi SerialNumbersChanged."""
+        if not self.serial_number_lockout:
+            return
+        with self.clients_lock:
+            targets = [
+                (sock, entry) for sock, entry in self.clients.items()
+                if entry.serial_number_status == SNT_FREE
+            ]
+            current = self.next_serial
+        msg = TServerMessage(
+            sm_id=NET_SERVERMESSAGE_ID,
+            sm_message=SM_SERIAL_NUMBER_CHANGED,
+            sm_param=current,
+        ).pack()
+        dead: List[socket.socket] = []
+        for sock, entry in targets:
+            entry.serial_number = current
+            if _safe_sendall(sock, msg):
+                self.bytes_sent += len(msg)
+            else:
+                dead.append(sock)
+        for s in dead:
+            self.remove_client(s)
+
+    def _update_serial_numbers_status(self, sender: socket.socket, status: int):
+        """A client told us it has reserved or freed a serial number.
+        Mirrors Delphi UpdateSerialNumbersStatus (tr4wserverUnit.pas:1132).
+        Reservation bumps the shared counter; free just clears that client's
+        state. Either way we re-broadcast to all free clients so they see
+        the current next-serial."""
+        if not self.serial_number_lockout:
+            return
+        with self.clients_lock:
+            entry = self.clients.get(sender)
+            if entry is None:
+                return
+            entry.serial_number_status = status
+            if status == SNT_RESERVED:
+                # Delphi bumps clSerialNumber on ALL slots; we keep one
+                # shared counter that's equivalent.
+                self.next_serial += 1
+        self._send_serial_numbers_changed()
+
     def forward_spot_to_telnet_client(self, sender: socket.socket, data: bytes):
         """Forward DX spot to the (one) client connected to a telnet cluster.
         Mirrors the Delphi behavior: only the first matching peer receives it."""
@@ -1040,13 +1265,16 @@ class TR4WServer:
         msg = TServerMessage.unpack(data)
 
         if msg.sm_message == SM_SERIAL_NUMBER_CHANGED:
-            if self.serial_number_lockout:
-                # Handle serial number updates
-                pass
+            # smParam carries a TSerialNumberType (SNT_FREE / SNT_RESERVED).
+            self._update_serial_numbers_status(client_socket, msg.sm_param)
 
         elif msg.sm_message == SM_CLEARALLLOGS_MESSAGE:
             if self.clear_server_log():
                 self.broadcast_to_clients(client_socket, data, include_sender=True)
+                # Delphi ClearServerLog re-runs ScanLogForSerialsNumbers
+                # (tr4wserverUnit.pas:796) — match that here.
+                if self.serial_number_lockout:
+                    self._scan_log_for_serials()
 
         elif msg.sm_message == SM_CLEAR_DUPESHEET_MESSAGE:
             # Set clear dupesheet bit in all QSOs
@@ -1182,6 +1410,7 @@ class TR4WServer:
             'rx':       self.bytes_received,
             'tx':       self.bytes_sent,
             'clients':  clients,
+            'last_qso': self.last_qso,  # already an immutable dict or None
         }
 
     # Column widths chosen to match TR4W's Network window labels while still
@@ -1197,10 +1426,24 @@ class TR4WServer:
             st="St", ptt="PTT", qs="Qs", call="Callsign", d="D",
             op="Op", ip="IP", host="Hostname",
         )
+        lq = snap.get('last_qso')
+        if lq is None:
+            last_line = "Last QSO: (none yet)"
+        else:
+            # action='edit' is the only one worth flagging; new/offline get added.
+            tag = ' (edit)' if lq['action'] == 'edit' else ''
+            band_mode = f"{lq['band']}{lq['mode']}" if lq['band'] else ''
+            last_line = (
+                f"Last QSO: {lq['when']}  {lq['call']:<10}"
+                f"  {band_mode:<6}  {lq['freq']:>9}"
+                f"  from {lq['sender']}{tag}"
+            )
+
         rows = [
             f"{SERVER_VERSION}  port {snap['port']}  "
             f"clients {len(snap['clients'])}/{MAX_CLIENTS}  "
             f"qsos {snap['qsos']}  rx {snap['rx']:,}  tx {snap['tx']:,}",
+            last_line,
             "-" * len(header),
             header,
             "-" * len(header),
@@ -1234,14 +1477,24 @@ class TR4WServer:
 
     def run_display_loop(self):
         """Refresh a status table on stdout every DISPLAY_REFRESH_INTERVAL
-        seconds. ANSI clear-screen — terminal-only, do not enable when stdout
-        is going to journald or a pipe."""
-        # ANSI: clear screen + home cursor.
-        clear = "\x1b[2J\x1b[H"
+        seconds. Uses ANSI clear-screen when the terminal supports it,
+        falls back to the platform `clear` command otherwise. Terminal-only
+        — do not enable when stdout is going to journald or a pipe."""
+        clear_ansi = "\x1b[2J\x1b[H"
+        # On Windows the ANSI sequence is silently dropped unless VT
+        # processing is explicitly enabled on the console — Python doesn't
+        # always set it. _enable_vt_processing() returns True on non-Windows
+        # platforms and on Windows builds where it succeeded.
+        use_ansi = _enable_vt_processing()
         try:
             while self.running:
                 snap = self.status_snapshot()
-                sys.stdout.write(clear)
+                if use_ansi:
+                    sys.stdout.write(clear_ansi)
+                else:
+                    # Fallback for older Windows consoles. Slower (spawns
+                    # cmd.exe each tick) but unambiguous.
+                    os.system('cls' if os.name == 'nt' else 'clear')
                 sys.stdout.write(self._format_status(snap))
                 sys.stdout.write("\n\n(press Ctrl+C to stop the server)\n")
                 sys.stdout.flush()
