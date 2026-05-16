@@ -125,6 +125,16 @@ _DEAD_CLIENT_ERRORS = (
 )
 
 
+def _cstring(buf: bytes) -> str:
+    """Decode a fixed-length null-terminated C string field. TR4W writes ASCII
+    callsigns/operator/name; treat anything else as garbage rather than
+    raising and tearing down the connection."""
+    end = buf.find(b'\x00')
+    if end >= 0:
+        buf = buf[:end]
+    return buf.decode('ascii', errors='replace').rstrip()
+
+
 def _safe_sendall(sock: socket.socket, data: bytes) -> bool:
     """sendall with the dead-client errors swallowed.
 
@@ -182,14 +192,54 @@ SIZE_OF_LOG_FILE_INFORMATION = 19  # struct.calcsize('<HIIIIB')
 
 @dataclass
 class ClientEntry:
-    """Client connection entry"""
-    conn: object = None  # socket.socket object
+    """Connected-client state. Most fields are populated lazily as the station
+    broadcasts its TStationState packets — until then they stay at the defaults
+    and render as blank in the status display."""
+    conn: object = None                       # socket.socket
     ip_address: str = ""
     hostname: str = ""
-    computer_id: str = ""
+    computer_id: str = ""                     # display letter A..Z
     connected_to_telnet: bool = False
     serial_number: int = 0
-    serial_number_status: int = 0  # 0=Free, 1=Reserved
+    serial_number_status: int = 0             # 0=Free, 1=Reserved
+
+    # Live status, sourced from TStationState (NET_STATIONSTATUS_ID) packets.
+    name: str = ""                            # ssName  (sstComputerNameAndID)
+    band: Optional[int] = None                # ssCurrentBand index (sstBandModeFreq)
+    mode: Optional[int] = None                # ssCurrentMode index (sstBandModeFreq)
+    freq_hz: int = 0                          # ssFreq             (sstBandModeFreq)
+    qsos: int = 0                             # ssQSOTotals        (sstQSOs)
+    callsign: str = ""                        # ssCallsign         (sstCallsign)
+    operator: str = ""                        # ssOperator         (sstOperator)
+    ptt_on: bool = False                      # bit 0 of ssStatusByte
+    sp_mode: bool = False                     # bit 1 (0=CQ/Run, 1=S&P)
+    dupe: bool = False                        # bit 2 (call window shows dupe)
+
+
+# StationStatusType enum values (VC.pas:1360). Order matters — index = ssType byte.
+SST_COMPUTER_NAME_AND_ID = 0
+SST_BAND_MODE_FREQ       = 1
+SST_PTT                  = 2
+SST_OP_MODE              = 3
+SST_QSOS                 = 4
+SST_CALLSIGN             = 5
+SST_OPERATOR             = 6
+
+# Status-byte bit layout (uNet.pas:169).
+STATUS_BIT_PTT          = 1 << 0
+STATUS_BIT_SP_MODE      = 1 << 1
+STATUS_BIT_DUPE         = 1 << 2
+STATUS_BIT_PTT_LOCKOUT  = 1 << 3
+
+# Display strings for the BandType / ModeType enums. Index = enum value.
+# Mirrors VC.pas:1275 (BandStringsArrayWithOutSpaces) and VC.pas:1239
+# (ModeStringArray). Update if BandType in VC.pas gains entries — order is
+# load-bearing because the wire format sends the raw enum index.
+BAND_NAMES = [
+    '160','80','40','20','15','10','30','17','12','6','2',
+    '222','432','902','1GH','2GH','3GH','5GH','10G','24G','LGT','All','NON',
+]
+MODE_NAMES = ['CW', 'DIGI', 'SSB', 'BTH', 'NON', 'FM']
 
 
 # ============================================================================
@@ -740,6 +790,7 @@ class TR4WServer:
                 self.broadcast_to_clients(client_socket, data, include_sender=True)
 
             elif msg_id == NET_STATIONSTATUS_ID:
+                self._update_station_state(client_socket, data)
                 self.broadcast_to_clients(client_socket, data, include_sender=True)
 
             elif msg_id == NET_NETWORKDXSPOT_ID:
@@ -906,11 +957,67 @@ class TR4WServer:
                     self.clients[client_socket].connected_to_telnet = (data[2] != 0)
 
     def set_computer_id(self, client_socket: socket.socket, data: bytes):
-        """Set computer ID for client"""
+        """Set the displayable A..Z computer ID for a client.
+
+        TR4W sends the ID as a small integer (1 for A, 2 for B, ...) — see
+        uNet.pas:662 `ComputerNetID.ciComputerID := Char(Ord(ComputerID) -
+        Ord('A') + 1)`. We translate back to the human letter so the status
+        display shows 'A', not '\\x01'."""
+        if len(data) < 3:
+            return
+        n = data[2]
+        letter = chr(ord('A') + n - 1) if 1 <= n <= 26 else f"?{n}"
         with self.clients_lock:
             if client_socket in self.clients:
-                if len(data) >= 3:
-                    self.clients[client_socket].computer_id = chr(data[2])
+                self.clients[client_socket].computer_id = letter
+
+    def _update_station_state(self, sender: socket.socket, data: bytes):
+        """Parse a TStationState broadcast and update the sender's live state.
+
+        Each packet (46 bytes) only carries the subset of fields relevant to
+        its ssType — other field positions hold stale data from the sender's
+        struct and must not be trusted. Mirrors how the TR4W client itself
+        handles incoming station-state packets (uNet.pas:DisplayClientStatus).
+
+        Field offsets within the packed TStationState record:
+          [0..1] ssID, [2..3] ssQSOTotals, [4] ssComputerID, [5] ssCurrentBand,
+          [6] ssCurrentMode, [7] ssStatusByte, [8..11] ssFreq,
+          [12..24] ssCallsign(13), [25..33] ssName(9), [34] ssType,
+          [35..45] ssOperator(11)."""
+        if len(data) < 46:
+            return
+        ss_type = data[34]
+        with self.clients_lock:
+            entry = self.clients.get(sender)
+            if entry is None:
+                return
+
+            if ss_type == SST_COMPUTER_NAME_AND_ID:
+                entry.name = _cstring(data[25:34])
+                # ssComputerID is the raw small-int form; convert to A..Z.
+                n = data[4]
+                if 1 <= n <= 26:
+                    entry.computer_id = chr(ord('A') + n - 1)
+
+            elif ss_type == SST_BAND_MODE_FREQ:
+                entry.band = data[5]
+                entry.mode = data[6]
+                entry.freq_hz = struct.unpack('<i', data[8:12])[0]
+
+            elif ss_type in (SST_PTT, SST_OP_MODE, SST_CALLSIGN):
+                # All three carry a fresh ssStatusByte.
+                sb = data[7]
+                entry.ptt_on = bool(sb & STATUS_BIT_PTT)
+                entry.sp_mode = bool(sb & STATUS_BIT_SP_MODE)
+                entry.dupe = bool(sb & STATUS_BIT_DUPE)
+                if ss_type == SST_CALLSIGN:
+                    entry.callsign = _cstring(data[12:25])
+
+            elif ss_type == SST_QSOS:
+                entry.qsos = struct.unpack('<H', data[2:4])[0]
+
+            elif ss_type == SST_OPERATOR:
+                entry.operator = _cstring(data[35:46])
 
     def forward_spot_to_telnet_client(self, sender: socket.socket, data: bytes):
         """Forward DX spot to the (one) client connected to a telnet cluster.
@@ -1038,17 +1145,37 @@ class TR4WServer:
     # ------------------------------------------------------------------
 
     def status_snapshot(self) -> Dict:
-        """Cheap, lock-light read of current state for the display threads."""
+        """Cheap, lock-light read of current state for the display threads.
+
+        Renders the same per-station fields TR4W's own Network window shows
+        (Name / Id / Band+Mode / Freq / St. / PTT / Qs / Callsign / D / Op),
+        plus the things only the server knows (IP, hostname, telnet flag)."""
         with self.clients_lock:
-            clients = [
-                {
+            clients = []
+            for e in self.clients.values():
+                if e.band is not None and 0 <= e.band < len(BAND_NAMES):
+                    band_str = BAND_NAMES[e.band]
+                else:
+                    band_str = ""
+                if e.mode is not None and 0 <= e.mode < len(MODE_NAMES):
+                    mode_str = MODE_NAMES[e.mode]
+                else:
+                    mode_str = ""
+                clients.append({
                     'ip':       e.ip_address,
                     'host':     e.hostname,
                     'comp_id':  e.computer_id or '-',
                     'telnet':   'yes' if e.connected_to_telnet else 'no',
-                }
-                for e in self.clients.values()
-            ]
+                    'name':     e.name,
+                    'band_mode': (band_str + mode_str) if band_str else "",
+                    'freq':     f"{e.freq_hz/1000:.2f}" if e.freq_hz else "",
+                    'st':       'SP' if e.sp_mode else 'CQ',
+                    'ptt':      'ON' if e.ptt_on else 'OFF',
+                    'qsos':     e.qsos,
+                    'call':     e.callsign,
+                    'dupe':     'D' if e.dupe else '',
+                    'op':       e.operator,
+                })
         return {
             'port':     self.port,
             'qsos':     self.get_qso_count(),
@@ -1057,23 +1184,46 @@ class TR4WServer:
             'clients':  clients,
         }
 
+    # Column widths chosen to match TR4W's Network window labels while still
+    # fitting in an 80-col terminal when possible. Total width = 105.
+    _STATUS_FMT = (
+        "{n:<3} {id:<2} {name:<8} {bm:<6} {freq:>8} {st:<2} {ptt:<3} "
+        "{qs:>4} {call:<10} {d:<1} {op:<10} {ip:<15} {host}"
+    )
+
     def _format_status(self, snap: Dict) -> str:
+        header = self._STATUS_FMT.format(
+            n="#", id="Id", name="Name", bm="B/M", freq="Freq",
+            st="St", ptt="PTT", qs="Qs", call="Callsign", d="D",
+            op="Op", ip="IP", host="Hostname",
+        )
         rows = [
             f"{SERVER_VERSION}  port {snap['port']}  "
             f"clients {len(snap['clients'])}/{MAX_CLIENTS}  "
             f"qsos {snap['qsos']}  rx {snap['rx']:,}  tx {snap['tx']:,}",
-            "-" * 78,
-            f"{'#':<3} {'IP':<17} {'Hostname':<28} {'CompID':<8} {'Telnet'}",
-            "-" * 78,
+            "-" * len(header),
+            header,
+            "-" * len(header),
         ]
         if not snap['clients']:
             rows.append("(no clients connected)")
         else:
             for i, c in enumerate(snap['clients'], 1):
-                rows.append(
-                    f"{i:<3} {c['ip']:<17} {c['host'][:28]:<28} "
-                    f"{c['comp_id']:<8} {c['telnet']}"
-                )
+                rows.append(self._STATUS_FMT.format(
+                    n=i,
+                    id=c['comp_id'][:2],
+                    name=c['name'][:8],
+                    bm=c['band_mode'][:6],
+                    freq=c['freq'][:8],
+                    st=c['st'],
+                    ptt=c['ptt'],
+                    qs=c['qsos'],
+                    call=c['call'][:10],
+                    d=c['dupe'],
+                    op=c['op'][:10],
+                    ip=c['ip'][:15],
+                    host=c['host'],
+                ))
         return "\n".join(rows)
 
     def print_status(self):
