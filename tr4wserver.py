@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 TR4WSERVER - Python implementation for Raspberry Pi
-A network server for TR4W ham radio logging application.
+A network server for the TR4W ham radio contest logging application.
 
-This is a Python port of the original Delphi TR4WSERVER.
-Licensed under GPL v3 (same as original TR4W project).
-
-Original copyright: Dmitriy Gulyaev UA4WLI 2015
-Python port: 2025
+Copyright 2025-2026 Thomas M. Schaefer (NY4I).
+This work is a derivative of TR4WSERVER by Dmitriy Gulyaev (UA4WLI),
+used under GPL v3. This work is licensed under GPL v3.
 """
 
 import socket
