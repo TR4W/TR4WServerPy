@@ -6,3 +6,7 @@ __pycache__/
 
 # Claude Code session/settings (per-developer, not part of the project)
 .claude/
+
+# --log-file / --trace-rx capture files (per-session diagnostic output)
+trace.txt
+trace*.log
