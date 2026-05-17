@@ -6,7 +6,8 @@ headlessly on a Raspberry Pi (or any Linux box) as the central hub for a
 multi-op station, accepting connections from TR4W clients on the local network
 so they can share QSO logs, DX spots, time sync, and intercom messages.
 
-Original Delphi server copyright Dmitriy Gulyaev UA4WLI 2015.
+Copyright 2026 Thomas M. Schaefer NY4I
+Original Delphi TR4WServer server copyright Dmitriy Gulyaev UA4WLI 2015.
 GPL v3 (same as TR4W itself).
 
 ---
