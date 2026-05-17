@@ -78,6 +78,8 @@ python3 tr4wserver.py [-h] [-c CONFIG] [-p PORT] [--password PASSWORD]
 | `--password PW` | Override the password from the INI. Useful for one-off testing. |
 | `--display` | Redraw a per-station status table on stdout every 2 seconds. Mirrors the columns TR4W's own Network window shows (Name, Id, Band+Mode, Freq, St, PTT, Qs, Callsign, D, Op) plus the IP and hostname. Requires a TTY — has no effect when stdout goes to systemd's journal. |
 | `--trace-rx` | Verbose protocol debug: log every `recv()` chunk in hex plus every framed message ID. Only useful when investigating a wire-format mismatch — leave off in normal use. |
+| `--log-file PATH` | Append all log output to `PATH` in addition to stderr/journalctl. Useful for capturing a `--trace-rx` session for later analysis without losing the live view. |
+| `--web-port PORT` | Serve a read-only HTML status page on `0.0.0.0:PORT`, in addition to the normal stdout/journalctl logging. Page auto-refreshes every 2 seconds. No auth — intended for a closed multi-op LAN. Overrides the `WEB PORT` INI key. |
 
 The `s` interactive command produces the same per-station table as `--display`,
 just as a one-shot snapshot instead of refreshing.
@@ -96,6 +98,7 @@ SERVER PASSWORD = TR4WSERVER
 ALLOW TIME SYNCHRONIZING = 1
 SERIAL NUMBER LOCKOUT = 0
 LOG RECORD SIZE = 376
+WEB PORT = 0
 ```
 
 | Key | Default | What it does |
@@ -105,6 +108,7 @@ LOG RECORD SIZE = 376
 | `ALLOW TIME SYNCHRONIZING` | `1` | When `1`, `NET_TIMESYN` packets from one station are relayed to the others (so all clients agree on UTC). Set to `0` to disable. |
 | `SERIAL NUMBER LOCKOUT` | `0` | Enables shared-serial coordination across multiple stations. When `1`, the server scans `SERVERLOG.TRW` at startup to find the highest `NumberSent` and seeds the next-serial counter to `max + 1`. Each connecting client is told the current next-serial; when any client reserves it (operator starts typing a callsign), the counter is bumped and every other free client is notified. Only matters in serial-exchange contests run as a multi-op with more than one station issuing serials at the same time. |
 | `LOG RECORD SIZE` | `376` | `SizeOf(ContestExchange)` in bytes. See [TR4W version compatibility](#tr4w-version-compatibility) — only touch this if a TR4W update has changed the on-disk QSO record size and the server refuses to start because of a size mismatch. |
+| `WEB PORT` | `0` (off) | If non-zero, bring up a read-only HTML status page on this TCP port (bound to all interfaces). Auto-refreshes every 2 seconds. Convenient for watching activity from a phone or tablet during a contest without SSH. No authentication — only enable on a closed LAN. Must not equal `PORT` or `PORT+1`. |
 
 ### Changing the password
 

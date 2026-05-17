@@ -16,12 +16,14 @@ import threading
 import configparser
 import concurrent.futures
 import os
+import html
 import signal
 import sys
 import time
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
@@ -44,6 +46,7 @@ HOSTNAME_LOOKUP_TIMEOUT  = 2     # bound on synchronous DNS during accept
 PASSWORD_RECV_TIMEOUT    = 10    # initial handshake — short, not 5 min
 HEARTBEAT_INTERVAL       = 60    # log a one-line stats heartbeat every minute
 DISPLAY_REFRESH_INTERVAL = 2     # interactive --display redraw cadence
+WEB_REFRESH_INTERVAL     = 2     # browser meta-refresh cadence for --web-port
 # Largest legitimate message is NET_PARAMETER_ID (514 bytes); anything past
 # this in a single un-framed buffer means we're out of sync with the client.
 MAX_CLIENT_BUFFER        = 8192
@@ -134,6 +137,108 @@ def _cstring(buf: bytes) -> str:
     if end >= 0:
         buf = buf[:end]
     return buf.decode('ascii', errors='replace').rstrip()
+
+
+class _StatusHTTPHandler(BaseHTTPRequestHandler):
+    """Read-only status page for the optional embedded web server.
+
+    Single GET / endpoint returns an HTML page with the same status text
+    the terminal display renders, wrapped in <pre> with a meta-refresh
+    so a browser tab (phone, tablet, another laptop on the FD LAN) gets
+    a self-updating view without SSH. No auth — operator state is not
+    sensitive on a closed multi-op LAN. Don't expose this to the
+    public internet."""
+
+    # server.tr4w_server is set by start_web_server() on the
+    # ThreadingHTTPServer instance.
+    def do_GET(self):  # noqa: N802  (stdlib API)
+        tr4w = getattr(self.server, 'tr4w_server', None)
+        if tr4w is None:
+            self._send_plain(503, b'server not ready\n')
+            return
+
+        if self.path in ('/', '/index.html'):
+            self._send_html(self._render_shell(tr4w))
+        elif self.path == '/status':
+            body = tr4w._format_status(tr4w.status_snapshot())
+            self._send_plain(200, body.encode('utf-8'),
+                             content_type='text/plain; charset=utf-8')
+        else:
+            self._send_plain(404, b'not found\n')
+
+    def _send_plain(self, status: int, body: bytes,
+                    content_type: str = 'text/plain; charset=utf-8'):
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, body: bytes):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _render_shell(self, tr4w) -> bytes:
+        """The HTML shell is fetched ONCE per browser tab. After that the
+        embedded JavaScript polls /status every WEB_REFRESH_INTERVAL seconds
+        and replaces only the <pre> content. The page itself never
+        navigates, so a server outage shows an "offline" indicator on the
+        already-loaded page instead of being replaced by the browser's
+        own error page — important for a kiosk display."""
+        initial_text = tr4w._format_status(tr4w.status_snapshot())
+        page = f"""<!DOCTYPE html>
+<html><head>
+<title>TR4WSERVER status</title>
+<style>
+body {{ font-family: monospace; background: #111; color: #eee;
+       margin: 1em; font-size: 14px; }}
+pre {{ margin: 0; }}
+#indicator {{ margin-top: 1em; font-size: 12px; color: #888; }}
+#indicator.online  {{ color: #0c0; }}
+#indicator.offline {{ color: #c66; }}
+</style>
+</head><body>
+<pre id="status">{html.escape(initial_text)}</pre>
+<div id="indicator" class="online">starting...</div>
+<script>
+const REFRESH_MS = {WEB_REFRESH_INTERVAL * 1000};
+const statusEl = document.getElementById('status');
+const indEl    = document.getElementById('indicator');
+async function tick() {{
+  try {{
+    const r = await fetch('/status', {{cache: 'no-store'}});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    statusEl.textContent = await r.text();
+    indEl.className = 'online';
+    indEl.textContent = 'connected - last update ' + new Date().toLocaleTimeString();
+  }} catch (e) {{
+    indEl.className = 'offline';
+    indEl.textContent = 'server unreachable - showing last known state ('
+                      + new Date().toLocaleTimeString() + ')';
+  }}
+}}
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body></html>
+"""
+        return page.encode('utf-8')
+
+    def log_message(self, fmt, *args):
+        # Route per-request lines to our logger at DEBUG so journalctl
+        # isn't spammed every 2 seconds by browser polling. Surface
+        # 4xx/5xx at INFO so accidental misconfig is still visible.
+        try:
+            status = int(args[1])
+        except (IndexError, ValueError, TypeError):
+            status = 0
+        level = logging.INFO if status >= 400 else logging.DEBUG
+        logger.log(level, "web: %s - %s", self.address_string(), fmt % args)
 
 
 def _enable_vt_processing() -> bool:
@@ -375,6 +480,12 @@ class TR4WServer:
         # don't need a lock.
         self.last_qso: Optional[Dict] = None
 
+        # Optional embedded web status page. 0 disables; otherwise binds to
+        # 0.0.0.0:web_port. Set from INI (WEB PORT) and/or --web-port.
+        self.web_port = 0
+        self._web_httpd: Optional[ThreadingHTTPServer] = None
+        self._web_thread: Optional[threading.Thread] = None
+
         self.clients: Dict[socket.socket, ClientEntry] = {}
         self.clients_lock = threading.Lock()
 
@@ -433,6 +544,7 @@ class TR4WServer:
             self.allow_time_sync = config.getint(section, 'ALLOW TIME SYNCHRONIZING', fallback=1) == 1
             self.serial_number_lockout = config.getint(section, 'SERIAL NUMBER LOCKOUT', fallback=0) == 1
             self.log_record_size = config.getint(section, 'LOG RECORD SIZE', fallback=DEFAULT_LOG_RECORD_SIZE)
+            self.web_port = config.getint(section, 'WEB PORT', fallback=0)
         except (ValueError, configparser.Error) as e:
             logger.error(f"Bad value in {self.config_file}: {e}. Using defaults for affected keys.")
 
@@ -447,6 +559,7 @@ class TR4WServer:
             'ALLOW TIME SYNCHRONIZING': '1' if self.allow_time_sync else '0',
             'SERIAL NUMBER LOCKOUT': '1' if self.serial_number_lockout else '0',
             'LOG RECORD SIZE': str(self.log_record_size),
+            'WEB PORT': str(self.web_port),
         }
         with open(self.config_file, 'w') as f:
             config.write(f)
@@ -571,6 +684,46 @@ class TR4WServer:
         threading.Thread(target=self.accept_clients,      daemon=True, name='accept-main').start()
         threading.Thread(target=self.accept_sync_clients, daemon=True, name='accept-sync').start()
         threading.Thread(target=self._heartbeat_loop,     daemon=True, name='heartbeat').start()
+
+        if self.web_port:
+            self._start_web_server(self.web_port)
+
+    def _start_web_server(self, port: int):
+        """Bring up the optional read-only HTTP status page on 0.0.0.0:port.
+        Failure to bind is logged but non-fatal — the main message bus is
+        the real service, the web page is just convenience."""
+        if port in (self.port, self.port + 1):
+            # Windows SO_REUSEADDR semantics would let this "succeed" but
+            # connections get split between the two listeners, breaking both.
+            logger.error(
+                f"Web port {port} collides with the message ({self.port}) or "
+                f"sync ({self.port + 1}) port; skipping web status page."
+            )
+            return
+        try:
+            httpd = ThreadingHTTPServer(('0.0.0.0', port), _StatusHTTPHandler)
+        except OSError as e:
+            logger.error(f"Web status port {port} unavailable: {e}; continuing without it")
+            return
+        httpd.tr4w_server = self
+        self._web_httpd = httpd
+        self._web_thread = threading.Thread(
+            target=httpd.serve_forever, daemon=True, name='web-status',
+            kwargs={'poll_interval': 0.5},  # responsiveness to shutdown()
+        )
+        self._web_thread.start()
+        logger.info(f"Web status page on http://0.0.0.0:{port}/")
+
+    def _stop_web_server(self):
+        if self._web_httpd is None:
+            return
+        try:
+            self._web_httpd.shutdown()
+            self._web_httpd.server_close()
+        except Exception as e:
+            logger.warning(f"Web status shutdown error: {e}")
+        self._web_httpd = None
+        self._web_thread = None
 
     def _make_listener(self, port: int, backlog: int) -> socket.socket:
         """Create+bind+listen on a port. Caller handles OSError."""
@@ -1216,14 +1369,23 @@ class TR4WServer:
             sm_param=current,
         ).pack()
         dead: List[socket.socket] = []
+        recipients = []
         for sock, entry in targets:
             entry.serial_number = current
             if _safe_sendall(sock, msg):
                 self.bytes_sent += len(msg)
+                recipients.append(entry.computer_id or '?')
             else:
                 dead.append(sock)
         for s in dead:
             self.remove_client(s)
+        if recipients:
+            logger.info(
+                f"serial: broadcast next={current} to {len(recipients)} free "
+                f"client(s) [{','.join(recipients)}]"
+            )
+        else:
+            logger.info(f"serial: would broadcast next={current} but no free clients")
 
     def _update_serial_numbers_status(self, sender: socket.socket, status: int):
         """A client told us it has reserved or freed a serial number.
@@ -1232,16 +1394,31 @@ class TR4WServer:
         state. Either way we re-broadcast to all free clients so they see
         the current next-serial."""
         if not self.serial_number_lockout:
+            logger.info(
+                "serial: ignoring SM_SERIAL_NUMBER_CHANGED from client "
+                "(SERIAL NUMBER LOCKOUT is disabled)"
+            )
             return
         with self.clients_lock:
             entry = self.clients.get(sender)
             if entry is None:
                 return
+            sender_id = entry.computer_id or '?'
+            prev_status = entry.serial_number_status
             entry.serial_number_status = status
             if status == SNT_RESERVED:
                 # Delphi bumps clSerialNumber on ALL slots; we keep one
                 # shared counter that's equivalent.
                 self.next_serial += 1
+            new_counter = self.next_serial
+        status_name = {SNT_FREE: 'FREE', SNT_RESERVED: 'RESERVED',
+                       SNT_UNKNOWN: 'UNKNOWN'}.get(status, f'?{status}')
+        prev_name = {SNT_FREE: 'FREE', SNT_RESERVED: 'RESERVED',
+                     SNT_UNKNOWN: 'UNKNOWN'}.get(prev_status, f'?{prev_status}')
+        logger.info(
+            f"serial: client {sender_id} {prev_name} -> {status_name}; "
+            f"counter now {new_counter}"
+        )
         self._send_serial_numbers_changed()
 
     def forward_spot_to_telnet_client(self, sender: socket.socket, data: bytes):
@@ -1360,6 +1537,8 @@ class TR4WServer:
                     s.close()
                 except OSError:
                     pass
+
+        self._stop_web_server()
 
         try:
             self._resolver.shutdown(wait=False)
@@ -1523,7 +1702,34 @@ def main():
                         help='Log every recv()d byte chunk and every framed '
                              'message ID. Verbose — use only for debugging '
                              'a protocol mismatch.')
+    parser.add_argument('--log-file', metavar='PATH',
+                        help='Append all log output (heartbeat, connect/'
+                             'disconnect, serial: events, --trace-rx dumps, '
+                             'etc.) to this file IN ADDITION to stderr/'
+                             'journalctl. Useful for capturing a debug '
+                             'session for post-hoc analysis without losing '
+                             'the live view.')
+    parser.add_argument('--web-port', type=int, metavar='PORT',
+                        help='Serve a read-only HTML status page on the given '
+                             'TCP port, in addition to the journalctl output. '
+                             'Overrides the WEB PORT INI key. No auth — '
+                             'intended for a closed multi-op LAN.')
     args = parser.parse_args()
+
+    if args.log_file:
+        # Attach to the root logger so EVERY logger.* call in this module
+        # (and any libs) tees into the file. Append mode so a long capture
+        # across restarts doesn't blow away the previous run; rotate by
+        # hand if it grows too big.
+        try:
+            fh = logging.FileHandler(args.log_file, mode='a', encoding='utf-8')
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s'
+            ))
+            logging.getLogger().addHandler(fh)
+            logger.info(f"Logging to file: {args.log_file}")
+        except OSError as e:
+            logger.error(f"Cannot open --log-file {args.log_file}: {e}")
 
     try:
         server = TR4WServer(args.config)
@@ -1540,6 +1746,8 @@ def main():
         server.password = args.password
     if args.trace_rx:
         server.trace_rx = True
+    if args.web_port is not None:
+        server.web_port = args.web_port
 
     # systemd sends SIGTERM on stop. Without a handler Python kills the
     # process immediately, leaving partial broadcasts in flight.
