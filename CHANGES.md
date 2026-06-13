@@ -1,7 +1,7 @@
 # TR4WSERVER (Python) Change Log
 
 > Python port of the Delphi TR4WSERVER for TR4W contest logging
-> Repository: [github.com/ny4i/TR4WServer](https://github.com/ny4i/TR4WServer)
+> Repository: [github.com/TR4W/TR4WServerPy](https://github.com/TR4W/TR4WServerPy)
 > Generated: 2026-05-16
 
 ## Contributors
