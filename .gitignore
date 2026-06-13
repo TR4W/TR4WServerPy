@@ -1,6 +1,8 @@
 # Generated files
 SERVERLOG.TRW
-tr4wserver.ini
+# Per-developer runtime config. *.ini is ignored so a local tr4wserver.ini is
+# never clobbered by git; the tracked template is tr4wserver.ini.sample.
+*.ini
 *.pyc
 __pycache__/
 

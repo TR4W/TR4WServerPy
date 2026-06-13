@@ -107,6 +107,60 @@ DUMMYCONTEST = 0
 # of this value (matches Delphi tr4wserver.dpr:70-83).
 DEFAULT_LOG_RECORD_SIZE = 376
 
+# Default logging verbosity. Overridable via the LOG LEVEL INI key; accepts the
+# standard names DEBUG / INFO / WARNING / ERROR / CRITICAL. Note that --trace-rx
+# output is emitted at INFO, so a level of WARNING or above silences it.
+DEFAULT_LOG_LEVEL = 'INFO'
+
+
+def _resolve_log_level(name: str):
+    """Map an INI LOG LEVEL name to its numeric logging level.
+
+    Accepts the standard level names (case-insensitive). Returns None for an
+    unrecognized name so the caller can warn and fall back, rather than raising
+    — consistent with this module's swallow-and-default config handling. The
+    isinstance check guards against logging attributes that aren't levels
+    (e.g. 'getLogger'), which getattr would otherwise return."""
+    level = getattr(logging, name.strip().upper(), None)
+    return level if isinstance(level, int) else None
+
+
+CONFIG_FILENAME = 'tr4wserver.ini'
+
+
+def resolve_config_path(explicit: Optional[str]) -> str:
+    """Decide which configuration file the server should use.
+
+    An explicit --config path always wins, with no search. Otherwise search
+    most-specific-first, mirroring `git config` precedence (repo-local before
+    ~/.gitconfig before /etc) — the natural fit for an app deployed as a git
+    checkout:
+
+       1. <program dir>/tr4wserver.ini   — this deployment's config
+       2. ~/.config/tr4wserver.ini       — account-wide fallback
+
+    The first that exists is used. If neither exists, the program-dir path is
+    returned so the default is created there and the server works out of the
+    box; `*.ini` is gitignored, so `git pull` never clobbers it. Because the
+    program-dir copy wins, the ~/.config copy is consulted only when no
+    tr4wserver.ini sits in the program dir.
+
+    "Program dir" is the directory of this script (not the current working
+    directory), so the lookup is stable regardless of where the process was
+    launched from. Under the shipped systemd unit the two coincide anyway."""
+    if explicit:
+        return explicit
+
+    program_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(program_dir, CONFIG_FILENAME),
+        os.path.join(os.path.expanduser('~'), '.config', CONFIG_FILENAME),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
 
 class UnknownMessageError(Exception):
     """Raised when an inbound message ID isn't in self.message_sizes.
@@ -462,6 +516,7 @@ class TR4WServer:
         self.allow_time_sync = True
         self.serial_number_lockout = False
         self.log_record_size = DEFAULT_LOG_RECORD_SIZE
+        self.log_level = logging.INFO  # overridden by LOG LEVEL in load_config
         self.trace_rx = False  # set by --trace-rx; dumps raw recvs + frames
 
         # Serial-number lockout state. next_serial is the SHARED counter that
@@ -543,6 +598,18 @@ class TR4WServer:
             self.serial_number_lockout = config.getint(section, 'SERIAL NUMBER LOCKOUT', fallback=0) == 1
             self.log_record_size = config.getint(section, 'LOG RECORD SIZE', fallback=DEFAULT_LOG_RECORD_SIZE)
             self.web_port = config.getint(section, 'WEB PORT', fallback=0)
+
+            level_name = config.get(section, 'LOG LEVEL', fallback=DEFAULT_LOG_LEVEL)
+            level = _resolve_log_level(level_name)
+            if level is None:
+                logger.warning(f"Unknown LOG LEVEL '{level_name}' in {self.config_file}; "
+                               f"using {DEFAULT_LOG_LEVEL}.")
+                level = _resolve_log_level(DEFAULT_LOG_LEVEL)
+            self.log_level = level
+            # Set the root logger so the level applies uniformly to every
+            # handler (stderr/journal and any --log-file tee). This mirrors the
+            # basicConfig() call at import time, which also targets root.
+            logging.getLogger().setLevel(self.log_level)
         except (ValueError, configparser.Error) as e:
             logger.error(f"Bad value in {self.config_file}: {e}. Using defaults for affected keys.")
 
@@ -558,6 +625,7 @@ class TR4WServer:
             'SERIAL NUMBER LOCKOUT': '1' if self.serial_number_lockout else '0',
             'LOG RECORD SIZE': str(self.log_record_size),
             'WEB PORT': str(self.web_port),
+            'LOG LEVEL': logging.getLevelName(self.log_level),
         }
         with open(self.config_file, 'w') as f:
             config.write(f)
@@ -1690,7 +1758,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='TR4WSERVER - Ham Radio Logging Server for Raspberry Pi')
-    parser.add_argument('-c', '--config', default='tr4wserver.ini', help='Configuration file')
+    parser.add_argument('-c', '--config', default=None,
+                        help='Configuration file. If omitted, the server looks '
+                             'for tr4wserver.ini in the program directory '
+                             'first, then ~/.config/tr4wserver.ini, and creates '
+                             'a default in the program directory if neither '
+                             'exists. An explicit path here bypasses that search.')
     parser.add_argument('-p', '--port', type=int, help='Server port (overrides config)')
     parser.add_argument('--password', help='Server password (overrides config)')
     parser.add_argument('--display', action='store_true',
@@ -1729,8 +1802,10 @@ def main():
         except OSError as e:
             logger.error(f"Cannot open --log-file {args.log_file}: {e}")
 
+    config_path = resolve_config_path(args.config)
+
     try:
-        server = TR4WServer(args.config)
+        server = TR4WServer(config_path)
     except RuntimeError as e:
         # init_log_file refused because of an on-disk size mismatch — a clear
         # operator-actionable error. Re-raised here so systemd's exit code is

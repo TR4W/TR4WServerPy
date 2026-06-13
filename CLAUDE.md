@@ -29,7 +29,9 @@ There is no build, no test suite, and no dependency file — the server uses onl
 - Deploy on Raspberry Pi: `./install.sh` rewrites `tr4wserver.service` to point at the current directory, copies it to `/etc/systemd/system/`, enables, and starts it. The unit file as committed hard-codes `User=pi` and `/home/pi/tr4wserverpy` — `install.sh` only patches the path, not the user.
 - Service logs: `sudo journalctl -u tr4wserver -f`
 
-Runtime artifacts (`SERVERLOG.TRW`, `tr4wserver.ini`) are gitignored and created on first run in the working directory.
+Runtime artifacts (`SERVERLOG.TRW`, `tr4wserver.ini`) are gitignored (`*.ini` and `SERVERLOG.TRW`) and created on first run. The repo tracks a documented template, `tr4wserver.ini.sample`.
+
+**Config resolution** (`resolve_config_path` in `tr4wserver.py`): an explicit `-c/--config` path wins outright; otherwise the server searches most-specific-first — `<program dir>/tr4wserver.ini`, then `~/.config/tr4wserver.ini` — mirroring `git config` precedence. The first that exists is used; if neither exists the default is created in the **program directory** (the script's own directory, via `__file__`, not necessarily CWD). `SERVERLOG.TRW` is still created relative to CWD; under the shipped systemd unit (`WorkingDirectory` = program dir) the two coincide.
 
 ## Architecture
 

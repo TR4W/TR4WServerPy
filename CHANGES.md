@@ -13,6 +13,24 @@
 
 ---
 
+### Unreleased — NY4I
+
+Post-1.0 changes. **No wire-protocol or on-disk-format changes** — interoperability with unmodified TR4W clients is unaffected.
+
+#### Repository move to the TR4W organization
+
+- Repository transferred from `ny4i/TR4WServer` to **`TR4W/TR4WServerPy`** (GitHub ownership transfer — history and redirects preserved). Repository URL updated in `CHANGES.md`.
+- **Deploy directory renamed** `/home/pi/tr4wserver` → `/home/pi/tr4wserverpy` across `tr4wserver.service` (`WorkingDirectory`/`ExecStart`), `install.sh` (the `sed` placeholder it rewrites at install time — must match the unit file exactly or the path would be corrupted), `README.md`, and `CLAUDE.md`. The systemd service name, the `tr4wserver.py` filename, and `SyslogIdentifier` are intentionally unchanged.
+
+#### Configurable log level (`tr4wserver.py`, `README.md`)
+
+- **`LOG LEVEL` INI key (default `INFO`)** sets logging verbosity — `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`, case-insensitive (`_resolve_log_level`). Applied to the **root** logger so it governs the stderr/journal stream and any `--log-file` tee uniformly, mirroring the import-time `basicConfig`. Unknown values log a warning and fall back to `INFO`. Note: `WARNING` or above also hides the INFO startup banner and `--trace-rx` output (which is emitted at INFO).
+
+#### Config file search path + template (`tr4wserver.py`, `tr4wserver.ini.sample`, `.gitignore`, `README.md`, `CLAUDE.md`)
+
+- **Two-location config search** (`resolve_config_path`): when `--config` is not given, the server looks in the program directory first, then `~/.config/tr4wserver.ini` — most-specific-first, the same precedence `git config` uses. An explicit `--config PATH` bypasses the search. If neither exists, the default is created in the program directory (program-dir copy wins, so `~/.config` is the fallback only when no program-dir ini exists). "Program dir" is the script's own directory (`__file__`), not CWD.
+- **`tr4wserver.ini.sample`** added as a tracked, documented template; `.gitignore` broadened from `tr4wserver.ini` to `*.ini` so a per-developer local config is never clobbered by `git pull` (the `.sample` template stays tracked because it isn't a `*.ini`).
+
 ### 1.0 (2026-05-16) — NY4I
 
 First versioned release. Establishes baseline parity with the Delphi `tr4wserver.exe` wire protocol as of TR4W log format **v1.7** (`SizeOf(ContestExchange) = 376`), plus operational hardening for unattended Raspberry Pi deployment.

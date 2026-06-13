@@ -89,8 +89,19 @@ just as a one-shot snapshot instead of refreshing.
 
 ## The INI file
 
-`tr4wserver.ini` is plain key/value, generated on first run if missing. All
-keys live under a `[TR4WSERVER]` section.
+`tr4wserver.ini` is plain key/value; all keys live under a `[TR4WSERVER]`
+section. The repo ships a documented template, `tr4wserver.ini.sample` — copy
+it to `tr4wserver.ini` and edit, or just let the server generate one on first
+run.
+
+**Where the server looks for it** (when `--config` is not given): the program
+directory first, then `~/.config/tr4wserver.ini`. The first that exists is used
+— most-specific-first, the same precedence `git config` uses. If neither
+exists, a default is created in the program directory. Because the program-dir
+copy wins, `~/.config/tr4wserver.ini` is consulted only when no `tr4wserver.ini`
+sits in the program directory. `*.ini` is gitignored, so your edits are never
+clobbered by `git pull`. Pass `--config PATH` to bypass the search and use an
+explicit file.
 
 ```ini
 [TR4WSERVER]
@@ -100,6 +111,7 @@ ALLOW TIME SYNCHRONIZING = 1
 SERIAL NUMBER LOCKOUT = 0
 LOG RECORD SIZE = 376
 WEB PORT = 0
+LOG LEVEL = INFO
 ```
 
 | Key | Default | What it does |
@@ -110,6 +122,7 @@ WEB PORT = 0
 | `SERIAL NUMBER LOCKOUT` | `0` | Enables shared-serial coordination across multiple stations. When `1`, the server scans `SERVERLOG.TRW` at startup to find the highest `NumberSent` and seeds the next-serial counter to `max + 1`. Each connecting client is told the current next-serial; when any client reserves it (operator starts typing a callsign), the counter is bumped and every other free client is notified. Only matters in serial-exchange contests run as a multi-op with more than one station issuing serials at the same time. |
 | `LOG RECORD SIZE` | `376` | `SizeOf(ContestExchange)` in bytes. See [TR4W version compatibility](#tr4w-version-compatibility) — only touch this if a TR4W update has changed the on-disk QSO record size and the server refuses to start because of a size mismatch. |
 | `WEB PORT` | `0` (off) | If non-zero, bring up a read-only HTML status page on this TCP port (bound to all interfaces). Auto-refreshes every 2 seconds. Convenient for watching activity from a phone or tablet during a contest without SSH. No authentication — only enable on a closed LAN. Must not equal `PORT` or `PORT+1`. |
+| `LOG LEVEL` | `INFO` | Logging verbosity. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive). An unrecognized value logs a warning and falls back to `INFO`. Note: this gates the **whole** log stream, so `WARNING` or above also hides the INFO startup banner (Server IP, listening ports) and any `--trace-rx` output, which is emitted at INFO. |
 
 ### Changing the password
 

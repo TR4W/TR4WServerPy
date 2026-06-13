@@ -1,0 +1,44 @@
+# TR4WSERVER configuration - sample.
+#
+# Copy this file to one of the locations the server searches, then edit it:
+#   1. <program dir>/tr4wserver.ini   (this deployment; checked first)
+#   2. ~/.config/tr4wserver.ini       (account-wide fallback)
+#
+# The program-directory copy wins when both exist (most-specific-first, the
+# same precedence `git config` uses). If neither exists, the server creates a
+# default tr4wserver.ini in the program directory on first run. *.ini is
+# gitignored, so your real config is never overwritten by a `git pull`.
+#
+# See README.md for the full description of each key.
+
+[TR4WSERVER]
+
+# TCP port for the main message bus. The log-sync port is always PORT + 1,
+# so the server binds two ports total.
+PORT = 1061
+
+# 10-byte ASCII password every connecting TR4W client must send, verbatim.
+# CHANGE THIS from the default before exposing the server on a shared LAN.
+SERVER PASSWORD = TR4WSERVER
+
+# 1 = relay NET_TIMESYN packets between stations (clients agree on UTC).
+# 0 = disable time-sync relaying.
+ALLOW TIME SYNCHRONIZING = 1
+
+# 1 = coordinate a single shared serial-number sequence across stations.
+# 0 = off. Only matters for serial-exchange contests run multi-op.
+SERIAL NUMBER LOCKOUT = 0
+
+# SizeOf(ContestExchange) in bytes - the on-disk QSO record size. Only change
+# this if a TR4W update alters the record size and the server refuses to start
+# on a size mismatch.
+LOG RECORD SIZE = 376
+
+# Non-zero = serve a read-only HTML status page on this TCP port (bound to all
+# interfaces, no auth - closed LAN only). Must not equal PORT or PORT+1.
+# 0 = off.
+WEB PORT = 0
+
+# Logging verbosity: DEBUG, INFO, WARNING, ERROR, or CRITICAL (case-insensitive).
+# WARNING or above also hides the INFO startup banner and any --trace-rx output.
+LOG LEVEL = INFO
