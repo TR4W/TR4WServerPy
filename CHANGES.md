@@ -13,6 +13,22 @@
 
 ---
 
+### Unreleased — NY4I
+
+Logging improvements. **No wire-protocol or on-disk-format changes** — interoperability with unmodified TR4W clients is unaffected.
+
+#### Custom TRACE level + structured message logging (`tr4wserver.py`, `CLAUDE.md`)
+
+- **New `TRACE` level (5, below `DEBUG`)** registered at import (`logging.addLevelName` + `logging.TRACE` + a `Logger.trace` method). `LOG LEVEL = TRACE` is now valid and round-trips through `_resolve_log_level`/`getLevelName`.
+- **`DEBUG` now logs one line per inbound message** — `RX <NAME> (0x….) from <peer> <N>B` — via a new `MESSAGE_NAMES` id→name map, emitted in `process_buffer`. The peer is resolved once per connection in `handle_client` (previously computed only when tracing).
+- **HTTP `log_message`**: normal per-request lines moved from `DEBUG` to `TRACE` (browser polls every 2s); `status >= 400` moved from `INFO` to `WARNING` so misconfig stays visible at the default level.
+
+#### Configurable RX/TX tracing (`tr4wserver.py`, `tr4wserver.ini.sample`, `README.md`)
+
+- **`TRACE RX` / `TRACE TX` INI keys** (bool, default `0`) plus a new `--trace-tx` CLI flag mirroring `--trace-rx`. `trace_rx` was previously CLI-only; both are now settings and overridable from the CLI.
+- **Raw byte dumps now emit at `TRACE`** (were `INFO`). Enabling either flag (INI or CLI) **forces the effective log level to TRACE** in `main()` so the dumps appear regardless of `LOG LEVEL` — the flag is the whole knob.
+- **TX tracing added** at `_safe_sendall`, now an instance method wrapping the module-level `_raw_sendall`, so every send path (broadcasts, password replies, log-info, confirms, sync transfer) funnels through one trace point.
+
 ### 1.1 (2026-06-13) — NY4I
 
 Post-1.0 changes. **No wire-protocol or on-disk-format changes** — interoperability with unmodified TR4W clients is unaffected.

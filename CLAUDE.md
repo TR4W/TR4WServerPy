@@ -90,6 +90,13 @@ All sizes below are derived from the current `VC.pas` and `tr4wserver.cfg`, trea
 - **`forward_spot_to_telnet_client` only sends to the first client with `connected_to_telnet=True`** — that's intentional (the spot is forwarded to the one station that has the upstream telnet/cluster connection), not a bug to "fix" by broadcasting.
 - **Unknown message IDs disconnect the offending client** (rather than silently break out of parsing). This is more aggressive than the Delphi server, which falls through silently — but the Delphi behavior risks an infinite reparse loop, and a noisy disconnect here makes layout drift visible immediately.
 
+## Logging scheme
+
+- **Custom `TRACE` level (5, below `DEBUG`)** is registered process-wide at import: `logging.addLevelName`, `logging.TRACE = 5` (so the `LOG LEVEL` key round-trips it), and a `logging.Logger.trace` method is monkeypatched on. The monkeypatch is a deliberate process-global side effect — fine for a single-purpose script, but be aware it affects every logger in the process.
+- **Level tiers**: `INFO` = lifecycle/banner; `DEBUG` = one line per inbound message (id + sender, via `MESSAGE_NAMES`) in `process_buffer`; `TRACE` = raw byte dumps + per-request web logs.
+- **`trace_rx` / `trace_tx`** (INI `TRACE RX`/`TRACE TX`, or `--trace-rx`/`--trace-tx`) gate the raw hex dumps. Enabling either **forces the effective log level to TRACE** in `main()` after config + CLI are resolved — the flag is the whole knob. RX dumps live in `handle_client`/`process_buffer`; TX dumps live in `_safe_sendall`, the instance wrapper every send funnels through (raw send is the module-level `_raw_sendall`).
+- **HTTP `log_message`** logs normal requests at TRACE (browser polls every 2s) and `status >= 400` at WARNING.
+
 ## Coding standards (from user globals)
 
 Python: 3-space indentation, spaces only. Readability over brevity. The existing file uses 4-space indentation throughout — match the surrounding style when editing existing functions; apply the 3-space rule to new files only, and flag any larger reformat as a separate change rather than mixing it into a feature edit.

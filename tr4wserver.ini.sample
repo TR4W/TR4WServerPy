@@ -39,6 +39,17 @@ LOG RECORD SIZE = 376
 # 0 = off.
 WEB PORT = 0
 
-# Logging verbosity: DEBUG, INFO, WARNING, ERROR, or CRITICAL (case-insensitive).
-# WARNING or above also hides the INFO startup banner and any --trace-rx output.
+# Logging verbosity: TRACE, DEBUG, INFO, WARNING, ERROR, or CRITICAL
+# (case-insensitive). DEBUG logs one line per message received (id + sender).
+# WARNING or above hides the INFO startup banner. TRACE is the most verbose
+# tier (raw byte dumps + per-request web logs) and is forced on automatically
+# when TRACE RX or TRACE TX is enabled below.
 LOG LEVEL = INFO
+
+# Raw-byte protocol tracing - for debugging wire-format mismatches only; very
+# verbose, leave off in normal use. 1 = on, 0 = off. Enabling either one forces
+# the effective log level to TRACE so the dumps appear regardless of LOG LEVEL.
+#   TRACE RX = dump every received chunk + framed message ID
+#   TRACE TX = dump every chunk sent to clients
+TRACE RX = 0
+TRACE TX = 0

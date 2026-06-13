@@ -69,7 +69,8 @@ lines (the installer only patches the path on its first run).
 
 ```
 python3 tr4wserver.py [-h] [-c CONFIG] [-p PORT] [--password PASSWORD]
-                      [--display] [--trace-rx]
+                      [--display] [--trace-rx] [--trace-tx] [--log-file PATH]
+                      [--web-port PORT]
 ```
 
 | Flag | Purpose |
@@ -78,8 +79,9 @@ python3 tr4wserver.py [-h] [-c CONFIG] [-p PORT] [--password PASSWORD]
 | `-p, --port PORT` | Override the main listening port from the INI. The sync port is always `PORT + 1`. |
 | `--password PW` | Override the password from the INI. Useful for one-off testing. |
 | `--display` | Redraw a per-station status table on stdout every 2 seconds. Mirrors the columns TR4W's own Network window shows (Name, Id, Band+Mode, Freq, St, PTT, Qs, Callsign, D, Op) plus the IP and hostname. Requires a TTY — has no effect when stdout goes to systemd's journal. |
-| `--trace-rx` | Verbose protocol debug: log every `recv()` chunk in hex plus every framed message ID. Only useful when investigating a wire-format mismatch — leave off in normal use. |
-| `--log-file PATH` | Append all log output to `PATH` in addition to stderr/journalctl. Useful for capturing a `--trace-rx` session for later analysis without losing the live view. |
+| `--trace-rx` | Verbose protocol debug: dump every `recv()` chunk in hex plus every framed message ID, at TRACE level. Overrides the `TRACE RX` INI key and **forces the effective log level to TRACE**. Leave off in normal use. |
+| `--trace-tx` | Same as `--trace-rx` but for transmitted data — dumps every chunk sent to clients (broadcasts, replies, sync transfer). Overrides the `TRACE TX` INI key and forces TRACE level. |
+| `--log-file PATH` | Append all log output to `PATH` in addition to stderr/journalctl. Useful for capturing a `--trace-rx`/`--trace-tx` session for later analysis without losing the live view. |
 | `--web-port PORT` | Serve a read-only HTML status page on `0.0.0.0:PORT`, in addition to the normal stdout/journalctl logging. Page auto-refreshes every 2 seconds. No auth — intended for a closed multi-op LAN. Overrides the `WEB PORT` INI key. |
 
 The `s` interactive command produces the same per-station table as `--display`,
@@ -112,6 +114,8 @@ SERIAL NUMBER LOCKOUT = 0
 LOG RECORD SIZE = 376
 WEB PORT = 0
 LOG LEVEL = INFO
+TRACE RX = 0
+TRACE TX = 0
 ```
 
 | Key | Default | What it does |
@@ -122,7 +126,9 @@ LOG LEVEL = INFO
 | `SERIAL NUMBER LOCKOUT` | `0` | Enables shared-serial coordination across multiple stations. When `1`, the server scans `SERVERLOG.TRW` at startup to find the highest `NumberSent` and seeds the next-serial counter to `max + 1`. Each connecting client is told the current next-serial; when any client reserves it (operator starts typing a callsign), the counter is bumped and every other free client is notified. Only matters in serial-exchange contests run as a multi-op with more than one station issuing serials at the same time. |
 | `LOG RECORD SIZE` | `376` | `SizeOf(ContestExchange)` in bytes. See [TR4W version compatibility](#tr4w-version-compatibility) — only touch this if a TR4W update has changed the on-disk QSO record size and the server refuses to start because of a size mismatch. |
 | `WEB PORT` | `0` (off) | If non-zero, bring up a read-only HTML status page on this TCP port (bound to all interfaces). Auto-refreshes every 2 seconds. Convenient for watching activity from a phone or tablet during a contest without SSH. No authentication — only enable on a closed LAN. Must not equal `PORT` or `PORT+1`. |
-| `LOG LEVEL` | `INFO` | Logging verbosity. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive). An unrecognized value logs a warning and falls back to `INFO`. Note: this gates the **whole** log stream, so `WARNING` or above also hides the INFO startup banner (Server IP, listening ports) and any `--trace-rx` output, which is emitted at INFO. |
+| `LOG LEVEL` | `INFO` | Logging verbosity. One of `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive). An unrecognized value logs a warning and falls back to `INFO`. `DEBUG` adds one line per inbound message (id + sender). `TRACE` is the most verbose tier (raw byte dumps + per-request web logs). Note: this gates the **whole** log stream, so `WARNING` or above also hides the INFO startup banner (Server IP, listening ports). |
+| `TRACE RX` | `0` (off) | When `1`, dump every received `recv()` chunk in hex plus each framed message ID, at TRACE level. **Protocol-debug only**, very verbose. Enabling it forces the effective log level to TRACE so the dumps appear regardless of `LOG LEVEL`. Overridable with `--trace-rx`. |
+| `TRACE TX` | `0` (off) | Same as `TRACE RX` but for transmitted data — every chunk sent to clients (broadcasts, replies, sync transfer). Forces TRACE level. Overridable with `--trace-tx`. |
 
 ### Changing the password
 

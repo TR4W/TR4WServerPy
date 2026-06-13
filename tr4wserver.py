@@ -33,6 +33,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger('TR4WSERVER')
 
+# Custom TRACE level, one tier below DEBUG, for the verbose raw-byte dumps
+# (TRACE RX / TRACE TX) and the per-request web log line. Registered once at
+# import. Setting `logging.TRACE` keeps symmetry with the built-in level
+# attributes so `_resolve_log_level('TRACE')` (getattr) and
+# `logging.getLevelName()` round-trip the name like DEBUG/INFO/etc.
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, 'TRACE')
+logging.TRACE = TRACE_LEVEL
+
+
+def _logger_trace(self, message, *args, **kwargs):
+    """`logger.trace(...)` — emit at the custom TRACE level. Mirrors the stdlib
+    Logger.debug/info shape, including the `isEnabledFor` guard so the message
+    isn't formatted when TRACE is filtered out."""
+    if self.isEnabledFor(TRACE_LEVEL):
+        self._log(TRACE_LEVEL, message, args, **kwargs)
+
+
+logging.Logger.trace = _logger_trace
+
 # ----------------------------------------------------------------------------
 # Resilience tuning
 # ----------------------------------------------------------------------------
@@ -70,6 +90,28 @@ NET_CLIENTSTATUS_ID = 1110
 NET_SPOTVIANETWORK_ID = 1120
 NET_COMPUTERID_ID = 1130
 NET_SERVERMESSAGE_ID = 1140
+
+# Reverse map id -> short name, for the DEBUG "message received" log line.
+# Display only; never used for dispatch (process_message switches on the
+# numeric constants directly).
+MESSAGE_NAMES = {
+    NET_MESSAGESTATE_ID: 'MESSAGESTATE',
+    NET_LOGCOMPARE_ID: 'LOGCOMPARE',
+    NET_INTERCOMMESSAGE_ID: 'INTERCOMMESSAGE',
+    NET_NETWORKDXSPOT_ID: 'NETWORKDXSPOT',
+    NET_QSOINFO_ID: 'QSOINFO',
+    NET_EDITEDQSO_ID: 'EDITEDQSO',
+    NET_OFFLINEQSO_ID: 'OFFLINEQSO',
+    NET_THIS_QTC_WAS_SEND_ID: 'THIS_QTC_WAS_SEND',
+    NET_TAKESERVERQSO_ID: 'TAKESERVERQSO',
+    NET_TIMESYN_ID: 'TIMESYN',
+    NET_PARAMETER_ID: 'PARAMETER',
+    NET_STATIONSTATUS_ID: 'STATIONSTATUS',
+    NET_CLIENTSTATUS_ID: 'CLIENTSTATUS',
+    NET_SPOTVIANETWORK_ID: 'SPOTVIANETWORK',
+    NET_COMPUTERID_ID: 'COMPUTERID',
+    NET_SERVERMESSAGE_ID: 'SERVERMESSAGE',
+}
 # 4-byte sentinel a client sends to ask for an updated TLogFileInformation.
 # Value is verbatim from VC.pas:2644 — bytes are 50 29 9A B4 little-endian
 # (NOT the ASCII string "GHTR" that an earlier version of this file claimed).
@@ -282,14 +324,15 @@ setInterval(tick, REFRESH_MS);
         return page.encode('utf-8')
 
     def log_message(self, fmt, *args):
-        # Route per-request lines to our logger at DEBUG so journalctl
-        # isn't spammed every 2 seconds by browser polling. Surface
-        # 4xx/5xx at INFO so accidental misconfig is still visible.
+        # Route normal per-request lines to TRACE so journalctl isn't spammed
+        # every 2 seconds by browser polling — they appear only during a trace
+        # session. Surface 4xx/5xx at WARNING so accidental misconfig stays
+        # visible at the default level.
         try:
             status = int(args[1])
         except (IndexError, ValueError, TypeError):
             status = 0
-        level = logging.INFO if status >= 400 else logging.DEBUG
+        level = logging.WARNING if status >= 400 else TRACE_LEVEL
         logger.log(level, "web: %s - %s", self.address_string(), fmt % args)
 
 
@@ -321,12 +364,15 @@ def _enable_vt_processing() -> bool:
         return False
 
 
-def _safe_sendall(sock: socket.socket, data: bytes) -> bool:
+def _raw_sendall(sock: socket.socket, data: bytes) -> bool:
     """sendall with the dead-client errors swallowed.
 
     Returns True on success, False if the peer is gone or too slow. Callers
     that broadcast use the False return to mark the socket for cleanup;
-    callers replying to one client can ignore it."""
+    callers replying to one client can ignore it.
+
+    This is the raw sender; code paths go through `TR4WServer._safe_sendall`,
+    the instance wrapper that adds optional TRACE TX dumping."""
     try:
         sock.sendall(data)
         return True
@@ -517,7 +563,11 @@ class TR4WServer:
         self.serial_number_lockout = False
         self.log_record_size = DEFAULT_LOG_RECORD_SIZE
         self.log_level = logging.INFO  # overridden by LOG LEVEL in load_config
-        self.trace_rx = False  # set by --trace-rx; dumps raw recvs + frames
+        # Raw-byte trace toggles. Set by TRACE RX / TRACE TX (INI) or
+        # --trace-rx / --trace-tx (CLI). Enabling either forces the effective
+        # log level to TRACE at startup so the dumps actually appear.
+        self.trace_rx = False  # dump raw recv chunks + framed message IDs
+        self.trace_tx = False  # dump raw bytes sent through _safe_sendall
 
         # Serial-number lockout state. next_serial is the SHARED counter that
         # the Delphi server keeps mirrored across all 26 per-client slots;
@@ -598,6 +648,8 @@ class TR4WServer:
             self.serial_number_lockout = config.getint(section, 'SERIAL NUMBER LOCKOUT', fallback=0) == 1
             self.log_record_size = config.getint(section, 'LOG RECORD SIZE', fallback=DEFAULT_LOG_RECORD_SIZE)
             self.web_port = config.getint(section, 'WEB PORT', fallback=0)
+            self.trace_rx = config.getint(section, 'TRACE RX', fallback=0) == 1
+            self.trace_tx = config.getint(section, 'TRACE TX', fallback=0) == 1
 
             level_name = config.get(section, 'LOG LEVEL', fallback=DEFAULT_LOG_LEVEL)
             level = _resolve_log_level(level_name)
@@ -626,6 +678,8 @@ class TR4WServer:
             'LOG RECORD SIZE': str(self.log_record_size),
             'WEB PORT': str(self.web_port),
             'LOG LEVEL': logging.getLevelName(self.log_level),
+            'TRACE RX': '1' if self.trace_rx else '0',
+            'TRACE TX': '1' if self.trace_tx else '0',
         }
         with open(self.config_file, 'w') as f:
             config.write(f)
@@ -879,11 +933,11 @@ class TR4WServer:
                 data += tail
 
             if not self.check_password(data):
-                _safe_sendall(client_socket, PASS_TR4W)
+                self._safe_sendall(client_socket, PASS_TR4W)
                 logger.info(f"Client {addr[0]} - invalid password")
                 return
 
-            if not _safe_sendall(client_socket, SEND_TR4W):
+            if not self._safe_sendall(client_socket, SEND_TR4W):
                 return
 
             # Switch to operational timeouts (long recv, modest send).
@@ -986,7 +1040,7 @@ class TR4WServer:
             with self.log_lock:
                 log_size = self.get_log_size()
 
-                if not _safe_sendall(client_socket, struct.pack('<I', log_size)):
+                if not self._safe_sendall(client_socket, struct.pack('<I', log_size)):
                     logger.warning(f"Sync client {addr[0]} disconnected before header")
                     return
 
@@ -995,7 +1049,7 @@ class TR4WServer:
                         chunk = f.read(4096)
                         if not chunk:
                             break
-                        if not _safe_sendall(client_socket, chunk):
+                        if not self._safe_sendall(client_socket, chunk):
                             logger.warning(f"Sync client {addr[0]} disconnected mid-transfer")
                             return
                         self.bytes_sent += len(chunk)
@@ -1018,10 +1072,13 @@ class TR4WServer:
         we're out of sync with the client and trying to recover would risk
         log corruption."""
         buffer = b''
-        peer = None
-        if self.trace_rx:
-            try: peer = client_socket.getpeername()[0]
-            except OSError: peer = '?'
+        # Resolve the peer once per connection (cheap, one syscall) so it's
+        # available for both the DEBUG per-message line and the optional
+        # TRACE RX dump, regardless of whether tracing is on.
+        try:
+            peer = client_socket.getpeername()[0]
+        except OSError:
+            peer = '?'
 
         while self.running:
             try:
@@ -1033,8 +1090,8 @@ class TR4WServer:
                 buffer += data
 
                 if self.trace_rx:
-                    logger.info(f"RX[{peer}] +{len(data)}B buf={len(buffer)}B "
-                                f"head: {data[:64].hex(' ')}")
+                    logger.trace(f"RX[{peer}] +{len(data)}B buf={len(buffer)}B "
+                                 f"head: {data[:64].hex(' ')}")
 
                 if len(buffer) > MAX_CLIENT_BUFFER:
                     raise UnknownMessageError(
@@ -1042,7 +1099,7 @@ class TR4WServer:
                         f"{MAX_CLIENT_BUFFER}); message_sizes likely out of sync"
                     )
 
-                buffer = self.process_buffer(client_socket, buffer)
+                buffer = self.process_buffer(client_socket, buffer, peer)
 
             except UnknownMessageError as e:
                 # Layout drift between this server and the client. Disconnect
@@ -1060,14 +1117,18 @@ class TR4WServer:
                 logger.exception(f"Unexpected client handler error: {e}")
                 break
 
-    def process_buffer(self, client_socket: socket.socket, buffer: bytes) -> bytes:
-        """Process received data buffer and return remaining data"""
+    def process_buffer(self, client_socket: socket.socket, buffer: bytes,
+                       peer: str = '?') -> bytes:
+        """Process received data buffer and return remaining data.
+
+        `peer` is the sender's IP, used only for the DEBUG/TRACE log lines."""
         while len(buffer) >= 2:
             # NET_LOGINFO_MESSAGE is a 4-byte sentinel. Check it first because
             # its low Word doesn't collide with any real message ID.
             if len(buffer) >= 4:
                 dword = struct.unpack('<I', buffer[:4])[0]
                 if dword == NET_LOGINFO_MESSAGE:
+                    logger.debug(f"RX LOGINFO sentinel from {peer}")
                     self.send_log_file_info(client_socket)
                     buffer = buffer[4:]
                     continue
@@ -1086,8 +1147,12 @@ class TR4WServer:
             if len(buffer) < msg_size:
                 break  # Wait for more data
 
+            # DEBUG: one line per inbound message — what and from where.
+            # The full byte dump is TRACE-only, gated by TRACE RX below.
+            logger.debug(f"RX {MESSAGE_NAMES.get(msg_id, '?')} "
+                         f"(0x{msg_id:04x}) from {peer} {msg_size}B")
             if self.trace_rx:
-                logger.info(f"  frame id={msg_id} (0x{msg_id:04x}) size={msg_size}")
+                logger.trace(f"  frame id={msg_id} (0x{msg_id:04x}) size={msg_size}")
 
             message = buffer[:msg_size]
             buffer = buffer[msg_size:]
@@ -1149,6 +1214,34 @@ class TR4WServer:
         except Exception as e:
             logger.error(f"Error processing message {msg_id}: {e}")
 
+    def _trace_bytes(self, direction: str, sock: socket.socket, data: bytes):
+        """Dump raw bytes at TRACE level for TRACE RX / TRACE TX.
+
+        `direction` is 'RX' or 'TX'. The peer is resolved lazily (only when a
+        trace flag is on, since the dead-client path may already have torn the
+        socket down) and never raises. Only the first 64 bytes are shown — a
+        full QSO record is 384 bytes and dumping all of it per message would
+        bury the log."""
+        try:
+            peer = sock.getpeername()[0]
+        except OSError:
+            peer = '?'
+        preview = data[:64].hex(' ')
+        suffix = ' ...' if len(data) > 64 else ''
+        logger.trace(f"{direction}[{peer}] {len(data)}B {preview}{suffix}")
+
+    def _safe_sendall(self, sock: socket.socket, data: bytes) -> bool:
+        """Send all of `data`, dumping it first when TRACE TX is enabled.
+
+        Thin policy wrapper over the module-level `_raw_sendall` so every send
+        path (broadcasts, password replies, log-info, confirms, sync transfer)
+        funnels through one optional trace point. Returns `_raw_sendall`'s
+        True/False dead-peer result unchanged so existing callers are
+        unaffected."""
+        if self.trace_tx:
+            self._trace_bytes('TX', sock, data)
+        return _raw_sendall(sock, data)
+
     def broadcast_to_clients(self, sender: socket.socket, data: bytes, include_sender: bool = False):
         """Send `data` to every connected client (optionally including sender).
 
@@ -1162,7 +1255,7 @@ class TR4WServer:
                        if include_sender or s != sender]
 
         for s in targets:
-            if _safe_sendall(s, data):
+            if self._safe_sendall(s, data):
                 self.bytes_sent += len(data)
             else:
                 dead.append(s)
@@ -1180,7 +1273,7 @@ class TR4WServer:
         # li_local_crc32 / li_local_log_size remain 0 — Delphi side reads
         # them only on the client; the server never populates them.
 
-        if _safe_sendall(client_socket, info.pack()):
+        if self._safe_sendall(client_socket, info.pack()):
             self.bytes_sent += SIZE_OF_LOG_FILE_INFORMATION
 
     def get_contest_type(self) -> int:
@@ -1267,7 +1360,7 @@ class TR4WServer:
             sm_message=SM_RECEIVED_UPDATED_QSO_MESSAGE,
             sm_param=0
         )
-        if _safe_sendall(client_socket, msg.pack()):
+        if self._safe_sendall(client_socket, msg.pack()):
             self.bytes_sent += 8
 
     def update_client_status(self, client_socket: socket.socket, data: bytes):
@@ -1438,7 +1531,7 @@ class TR4WServer:
         recipients = []
         for sock, entry in targets:
             entry.serial_number = current
-            if _safe_sendall(sock, msg):
+            if self._safe_sendall(sock, msg):
                 self.bytes_sent += len(msg)
                 recipients.append(entry.computer_id or '?')
             else:
@@ -1498,7 +1591,7 @@ class TR4WServer:
                     break
         if target is None:
             return
-        if _safe_sendall(target, data):
+        if self._safe_sendall(target, data):
             self.bytes_sent += len(data)
         else:
             self.remove_client(target)
@@ -1559,7 +1652,7 @@ class TR4WServer:
         with self.clients_lock:
             targets = list(self.clients.keys())
         for s in targets:
-            if _safe_sendall(s, data):
+            if self._safe_sendall(s, data):
                 self.bytes_sent += 8
 
     def remove_client(self, client_socket: socket.socket):
@@ -1770,9 +1863,16 @@ def main():
                         help='Refresh a status table on stdout every 2s. '
                              'Requires a TTY. Do not use under systemd.')
     parser.add_argument('--trace-rx', action='store_true',
-                        help='Log every recv()d byte chunk and every framed '
-                             'message ID. Verbose — use only for debugging '
-                             'a protocol mismatch.')
+                        help='Dump every recv()d byte chunk and framed message '
+                             'ID at TRACE level. Overrides the TRACE RX INI key '
+                             'and forces the effective log level to TRACE. '
+                             'Verbose — use only for debugging a protocol '
+                             'mismatch.')
+    parser.add_argument('--trace-tx', action='store_true',
+                        help='Dump every chunk sent to clients at TRACE level. '
+                             'Overrides the TRACE TX INI key and forces the '
+                             'effective log level to TRACE. Verbose — use only '
+                             'for debugging a protocol mismatch.')
     parser.add_argument('--log-file', metavar='PATH',
                         help='Append all log output (heartbeat, connect/'
                              'disconnect, serial: events, --trace-rx dumps, '
@@ -1819,8 +1919,17 @@ def main():
         server.password = args.password
     if args.trace_rx:
         server.trace_rx = True
+    if args.trace_tx:
+        server.trace_tx = True
     if args.web_port is not None:
         server.web_port = args.web_port
+
+    # Either trace toggle forces TRACE verbosity so the raw dumps actually
+    # appear — turning on the flag is the whole knob (it overrides LOG LEVEL).
+    # Done here, after both INI and CLI sources have been resolved.
+    if server.trace_rx or server.trace_tx:
+        logging.getLogger().setLevel(TRACE_LEVEL)
+        logger.trace("TRACE level forced on by trace_rx/trace_tx")
 
     # systemd sends SIGTERM on stop. Without a handler Python kills the
     # process immediately, leaving partial broadcasts in flight.
