@@ -13,7 +13,7 @@
 
 ---
 
-### Unreleased — NY4I
+### 1.1 (2026-06-13) — NY4I
 
 Post-1.0 changes. **No wire-protocol or on-disk-format changes** — interoperability with unmodified TR4W clients is unaffected.
 
