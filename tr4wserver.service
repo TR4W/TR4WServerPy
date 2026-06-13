@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/tr4wserver
-ExecStart=/usr/bin/python3 /home/pi/tr4wserver/tr4wserver.py
+WorkingDirectory=/home/pi/tr4wserverpy
+ExecStart=/usr/bin/python3 /home/pi/tr4wserverpy/tr4wserver.py
 Restart=always
 RestartSec=5
 

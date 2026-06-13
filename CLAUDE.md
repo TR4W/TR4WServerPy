@@ -26,7 +26,7 @@ There is no build, no test suite, and no dependency file — the server uses onl
 - Run locally for development: `python3 tr4wserver.py`
 - Override config from CLI: `python3 tr4wserver.py -c <ini> -p <port> --password <pw>`
 - Interactive console while running: `s` prints status, `q` quits.
-- Deploy on Raspberry Pi: `./install.sh` rewrites `tr4wserver.service` to point at the current directory, copies it to `/etc/systemd/system/`, enables, and starts it. The unit file as committed hard-codes `User=pi` and `/home/pi/tr4wserver` — `install.sh` only patches the path, not the user.
+- Deploy on Raspberry Pi: `./install.sh` rewrites `tr4wserver.service` to point at the current directory, copies it to `/etc/systemd/system/`, enables, and starts it. The unit file as committed hard-codes `User=pi` and `/home/pi/tr4wserverpy` — `install.sh` only patches the path, not the user.
 - Service logs: `sudo journalctl -u tr4wserver -f`
 
 Runtime artifacts (`SERVERLOG.TRW`, `tr4wserver.ini`) are gitignored and created on first run in the working directory.

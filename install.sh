@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Installing TR4WSERVER as a systemd service..."
 
 # Update service file with correct path
-sed -i "s|/home/pi/tr4wserver|$SCRIPT_DIR|g" "$SCRIPT_DIR/tr4wserver.service"
+sed -i "s|/home/pi/tr4wserverpy|$SCRIPT_DIR|g" "$SCRIPT_DIR/tr4wserver.service"
 
 # Copy service file
 sudo cp "$SCRIPT_DIR/tr4wserver.service" /etc/systemd/system/

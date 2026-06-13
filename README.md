@@ -35,7 +35,7 @@ Interactive commands while it's running:
 
 ### Run it as a service on a Raspberry Pi
 
-Clone or copy the repo to `/home/pi/tr4wserver` (any path works — the installer
+Clone or copy the repo to `/home/pi/tr4wserverpy` (any path works — the installer
 patches the unit file). Then:
 
 ```sh
@@ -59,7 +59,7 @@ Connect/disconnect events and a once-per-minute heartbeat (`heartbeat
 clients=N/26 qsos=M rx=… tx=…`) appear in the journal, so a stuck server is
 visible without manual polling.
 
-If you're running outside the default `/home/pi/tr4wserver`, edit
+If you're running outside the default `/home/pi/tr4wserverpy`, edit
 `tr4wserver.service` after install to fix the `User=` and `WorkingDirectory=`
 lines (the installer only patches the path on its first run).
 
