@@ -157,6 +157,17 @@ defined by `VC.pas` in the TR4W source tree. As long as your clients and this
 server agree on the message record sizes and the `ContestExchange` layout, the
 server doesn't care which TR4W build is connecting.
 
+**This server speaks network protocol 2, which is TR4W 5.x.** A 5.x station's
+first message is a `HELLO` (protocol version, computer id, program version and
+the id of the contest it is running); the server answers with its own, tells a
+newcomer what every other station announced, and relays any change. A TR4W
+4.x (Delphi 7) station does not send one, is refused with `first message was
+not HELLO ... a 4.x client?` in the log, and cannot join: **a 4.x station never
+joins a 5.x network.** To serve a 4.x network, check out the git tag
+`d7-protocol`, the last version of this server that spoke the 4.x wire. A 5.x
+station and this server on different protocol versions refuse each other, and
+the station tells its operator which end to update.
+
 In practice that means:
 
 - **Routine TR4W releases that don't change any network record will Just Work.**
@@ -202,6 +213,8 @@ committed.
 | `Cannot bind to port 1061: …` at startup | Another `tr4wserver` is already running on the box, or another process is using the port | `sudo systemctl status tr4wserver`; kill any stray instance |
 | `SERVERLOG.TRW size … is not a multiple of LOG RECORD SIZE=376` | TR4W's `ContestExchange` record size has changed | Either delete `SERVERLOG.TRW` (loses the existing log) or set `LOG RECORD SIZE` in `tr4wserver.ini` to the new value |
 | `Client <ip> - invalid password` | Client's `Server password` doesn't match `SERVER PASSWORD` in the INI | Sync the values |
+| A station is dropped at once, `first message was not HELLO` | It is a TR4W 4.x (Delphi 7) station, or something else that does not speak network protocol 2 | Use TR4W 5.x on every station, or run the `d7-protocol` tag of this server for a 4.x network |
+| A station is dropped at once, `refused, it speaks network protocol N` | Station and server are on different protocol versions | Update the older of the two (the station says which) |
 | Connect-then-disconnect loop from a single client, `Disconnecting client: unknown or zero-size message ID …` | This server's per-message size table doesn't match what the client is sending | Capture a session with `--trace-rx` and check the message IDs / hex against `VC.pas` |
 | Server feels hung, no heartbeat in `journalctl` | Genuine wedge — should not happen, please report | `sudo systemctl restart tr4wserver` and capture logs |
 

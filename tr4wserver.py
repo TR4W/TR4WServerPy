@@ -90,6 +90,7 @@ NET_CLIENTSTATUS_ID = 1110
 NET_SPOTVIANETWORK_ID = 1120
 NET_COMPUTERID_ID = 1130
 NET_SERVERMESSAGE_ID = 1140
+NET_HELLO_ID = 1150
 
 # Reverse map id -> short name, for the DEBUG "message received" log line.
 # Display only; never used for dispatch (process_message switches on the
@@ -111,6 +112,7 @@ MESSAGE_NAMES = {
     NET_SPOTVIANETWORK_ID: 'SPOTVIANETWORK',
     NET_COMPUTERID_ID: 'COMPUTERID',
     NET_SERVERMESSAGE_ID: 'SERVERMESSAGE',
+    NET_HELLO_ID: 'HELLO',
 }
 # 4-byte sentinel a client sends to ask for an updated TLogFileInformation.
 # Value is verbatim from VC.pas:2644 — bytes are 50 29 9A B4 little-endian
@@ -126,11 +128,25 @@ SM_CLEAR_DUPESHEET_MESSAGE = 8280
 SM_CLEAR_MULTSHEET_MESSAGE = 8290
 SM_RECEIVED_UPDATED_QSO_MESSAGE = 8300
 SM_SERIAL_NUMBER_CHANGED = 8310
+# The server will not take this station's computer id. smParam is the id that
+# was refused, as the ordinal 1..26. Sent to the station that arrived second.
+SM_COMPUTERID_IN_USE_MESSAGE = 8320
+# The server will not speak this station's network protocol. smParam is the
+# protocol version the SERVER speaks. The server closes the connection after it.
+SM_PROTOCOL_MISMATCH_MESSAGE = 8330
+
+# Network protocol 2 (TR4W 5.x). The first message after the password must be a
+# HELLO; the two versions must be equal. Mirrors uNetHello.pas in the TR4W tree.
+# V1 (no HELLO at all) is what 4.x stations and the `d7-protocol` tag speak.
+NET_PROTOCOL_VERSION = 2
+HELLO_STRUCT = struct.Struct('<HHBB16s48s')   # id, protocol, computer id, reserved, version, contest id
+SIZE_OF_HELLO = HELLO_STRUCT.size             # 70
 
 # Server Constants
 MAX_CLIENTS = 26
 DEFAULT_PORT = 1061
 SERVER_VERSION = "TR4WSERVER Python 1.1"
+SERVER_HELLO_VERSION = "python-1.1"   # the version text in the server's HELLO (16 bytes at most)
 SEND_TR4W = b'TR4W'
 PASS_TR4W = b'PASS'
 
@@ -212,6 +228,13 @@ class UnknownMessageError(Exception):
     instead so the mismatch is visible in the logs."""
 
 
+class ProtocolViolationError(Exception):
+    """Raised when a connection breaks the network-protocol-2 handshake: its
+    first message was not a HELLO (a 4.x station sends COMPUTERID first), or its
+    HELLO names a protocol this server does not speak. The connection is closed;
+    the reason is in the message and is logged."""
+
+
 # Errors that mean "this one client is gone or unresponsive — drop it,
 # don't propagate." Anything else is logged as unexpected.
 _DEAD_CLIENT_ERRORS = (
@@ -221,6 +244,14 @@ _DEAD_CLIENT_ERRORS = (
     ConnectionAbortedError,
     OSError,  # catches "Bad file descriptor", "Transport endpoint not connected"
 )
+
+
+def _computer_id_ordinal(letter: str) -> int:
+    """'A'..'Z' as the ordinal the wire carries (A=1 .. Z=26); 0 for anything
+    else, which a client's range check then ignores."""
+    if len(letter) == 1 and 'A' <= letter <= 'Z':
+        return ord(letter) - ord('A') + 1
+    return 0
 
 
 def _cstring(buf: bytes) -> str:
@@ -435,6 +466,17 @@ class ClientEntry:
     serial_number: int = 0
     serial_number_status: int = 0             # 0=Free, 1=Reserved
 
+    # Network protocol 2. hello_seen: this connection has sent its HELLO, so
+    # anything else from it is now allowed. hello: the last HELLO the server
+    # ACCEPTED from it (70 bytes, b"" until there is one) — kept so a station
+    # that joins later is told what everyone else announced. contest_id and
+    # app_version are read from it for the log and the display only: the server
+    # never judges a contest, it stores and relays the text.
+    hello_seen: bool = False
+    hello: bytes = b""
+    contest_id: str = ""
+    app_version: str = ""
+
     # Live status, sourced from TStationState (NET_STATIONSTATUS_ID) packets.
     name: str = ""                            # ssName  (sstComputerNameAndID)
     band: Optional[int] = None                # ssCurrentBand index (sstBandModeFreq)
@@ -534,7 +576,7 @@ def _build_message_sizes(log_record_size: int) -> Dict[int, int]:
    return {
       NET_MESSAGESTATE_ID:    64,   # TMessageState (VC.pas:407)
       NET_STATIONSTATUS_ID:   46,   # TStationState (VC.pas:1362; +ssOperator from commit 6708783)
-      NET_NETWORKDXSPOT_ID:   98,   # TNetDXSpot (VC.pas:1976) = 2 + SizeOf(TSpotRecord)=96
+      NET_NETWORKDXSPOT_ID:  106,   # TNetDXSpot = 2 + SizeOf(TSpotRecord)=104 (FSysTime became a TDateTime, TR4W b285baf7; was 98 / 96)
       NET_TIMESYN_ID:         20,   # TNetTimeSync (VC.pas:1995)
       NET_PARAMETER_ID:      514,   # TParameterToNetwork (VC.pas:2006) = 2 + 256 + 256
       NET_INTERCOMMESSAGE_ID: 84,   # TIntercomMessage (VC.pas:2013) = 2 + 1 + 81 (Str80)
@@ -545,6 +587,7 @@ def _build_message_sizes(log_record_size: int) -> Dict[int, int]:
       NET_SPOTVIANETWORK_ID:  48,   # TSendSpotViaNetwork (VC.pas:1475) = 2 + 46
       NET_COMPUTERID_ID:       4,   # TComputerNetID (VC.pas:1483)
       NET_SERVERMESSAGE_ID:    8,   # TServerMessage (VC.pas:2020)
+      NET_HELLO_ID:     SIZE_OF_HELLO,   # THelloMessage (uNetHello.pas) = 2+2+1+1+16+48
    }
 
 
@@ -1107,6 +1150,11 @@ class TR4WServer:
                 # entry would otherwise cause an infinite reparse loop.
                 logger.error(f"Disconnecting client: {e}")
                 break
+            except ProtocolViolationError as e:
+                # Network protocol 2 handshake broken (no HELLO first, or a
+                # protocol this server does not speak). Not a server fault.
+                logger.warning(f"[Net] {e}")
+                break
             except socket.timeout:
                 logger.info(f"Client idle for >{SOCKET_RECV_TIMEOUT}s, disconnecting")
                 break
@@ -1128,6 +1176,7 @@ class TR4WServer:
             if len(buffer) >= 4:
                 dword = struct.unpack('<I', buffer[:4])[0]
                 if dword == NET_LOGINFO_MESSAGE:
+                    self._require_hello(client_socket, 'LOGINFO sentinel', peer)
                     logger.debug(f"RX LOGINFO sentinel from {peer}")
                     self.send_log_file_info(client_socket)
                     buffer = buffer[4:]
@@ -1147,6 +1196,11 @@ class TR4WServer:
             if len(buffer) < msg_size:
                 break  # Wait for more data
 
+            # Network protocol 2: nothing but HELLO until a HELLO has been seen.
+            if msg_id != NET_HELLO_ID:
+                self._require_hello(client_socket,
+                                    MESSAGE_NAMES.get(msg_id, str(msg_id)), peer)
+
             # DEBUG: one line per inbound message — what and from where.
             # The full byte dump is TRACE-only, gated by TRACE RX below.
             logger.debug(f"RX {MESSAGE_NAMES.get(msg_id, '?')} "
@@ -1163,7 +1217,10 @@ class TR4WServer:
     def process_message(self, client_socket: socket.socket, msg_id: int, data: bytes):
         """Process a complete message"""
         try:
-            if msg_id == NET_MESSAGESTATE_ID:
+            if msg_id == NET_HELLO_ID:
+                self._accept_hello(client_socket, data)
+
+            elif msg_id == NET_MESSAGESTATE_ID:
                 self.broadcast_to_clients(client_socket, data, include_sender=True)
 
             elif msg_id == NET_STATIONSTATUS_ID:
@@ -1211,8 +1268,96 @@ class TR4WServer:
             elif msg_id == NET_SERVERMESSAGE_ID:
                 self.handle_server_message(client_socket, data)
 
+        except ProtocolViolationError:
+            raise  # the connection is closed by handle_client, not swallowed here
         except Exception as e:
             logger.error(f"Error processing message {msg_id}: {e}")
+
+    def _require_hello(self, client_socket: socket.socket, what: str, peer: str):
+        """Network protocol 2: the first message on a connection must be a HELLO.
+        Raises ProtocolViolationError (the connection is dropped) for anything
+        else. A 4.x station sends COMPUTERID first, so this is also how one is
+        told apart from a station that speaks this protocol."""
+        with self.clients_lock:
+            entry = self.clients.get(client_socket)
+            ok = entry is None or entry.hello_seen
+        if not ok:
+            raise ProtocolViolationError(
+                f"{peer}: first message was not HELLO ({what}): a 4.x client? "
+                f"Connection dropped.")
+
+    def _hello_bytes(self, computer_id: int, version: str, contest_id: str) -> bytes:
+        """A HELLO as the 70 wire bytes."""
+        return HELLO_STRUCT.pack(
+            NET_HELLO_ID, NET_PROTOCOL_VERSION, computer_id, 0,
+            version.encode('ascii', 'replace'), contest_id.encode('ascii', 'replace'))
+
+    def _accept_hello(self, client_socket: socket.socket, data: bytes):
+        """A HELLO: judged, answered, recorded and passed on. The order is
+        deliberate (same as the Delphi server's AcceptHello): the protocol is
+        judged first, because a station that speaks another one can be told
+        nothing else; the server's own HELLO goes out BEFORE the computer id is
+        judged, so a station refused for its id has already seen which protocol
+        it is talking to; only an ACCEPTED hello is kept and relayed, so a
+        refused station never appears to the others. The server reads no
+        contest from it: it stores the text and relays it."""
+        _id, protocol, computer_id, _reserved, version, contest = HELLO_STRUCT.unpack(data[:SIZE_OF_HELLO])
+        version_text = version.split(b'\x00', 1)[0].decode('ascii', 'replace')
+        contest_text = contest.split(b'\x00', 1)[0].decode('ascii', 'replace')
+
+        with self.clients_lock:
+            entry = self.clients.get(client_socket)
+            if entry is None:
+                return
+            peer = entry.ip_address
+            first = not entry.hello_seen
+
+        if protocol != NET_PROTOCOL_VERSION:
+            msg = TServerMessage(
+                sm_id=NET_SERVERMESSAGE_ID,
+                sm_message=SM_PROTOCOL_MISMATCH_MESSAGE,
+                sm_param=NET_PROTOCOL_VERSION
+            )
+            if self._safe_sendall(client_socket, msg.pack()):
+                self.bytes_sent += 8
+            raise ProtocolViolationError(
+                f"{peer}: refused, it speaks network protocol {protocol} "
+                f"(version {version_text}) and this server speaks "
+                f"{NET_PROTOCOL_VERSION}. Connection dropped.")
+
+        with self.clients_lock:
+            entry.hello_seen = True
+
+        if first:
+            reply = self._hello_bytes(0, SERVER_HELLO_VERSION, '')
+            if self._safe_sendall(client_socket, reply):
+                self.bytes_sent += len(reply)
+
+        if not self._claim_computer_id(client_socket, computer_id):
+            return
+
+        accepted = bytes(data[:SIZE_OF_HELLO])
+        with self.clients_lock:
+            entry.hello = accepted
+            entry.contest_id = contest_text
+            entry.app_version = version_text
+            others = [(s, e.hello_seen, e.hello) for s, e in self.clients.items()
+                      if s is not client_socket]
+        logger.info(f"station {chr(ord('A') + computer_id - 1)} hello: protocol "
+                    f"{protocol}, version {version_text}, contest \"{contest_text}\"")
+
+        dead: List[socket.socket] = []
+        for other_socket, other_seen, other_hello in others:
+            if first and other_hello:
+                if self._safe_sendall(client_socket, other_hello):
+                    self.bytes_sent += len(other_hello)
+            if other_seen:
+                if self._safe_sendall(other_socket, accepted):
+                    self.bytes_sent += len(accepted)
+                else:
+                    dead.append(other_socket)
+        for s in dead:
+            self.remove_client(s)
 
     def _trace_bytes(self, direction: str, sock: socket.socket, data: bytes):
         """Dump raw bytes at TRACE level for TRACE RX / TRACE TX.
@@ -1372,7 +1517,7 @@ class TR4WServer:
                     self.clients[client_socket].connected_to_telnet = (data[2] != 0)
 
     def set_computer_id(self, client_socket: socket.socket, data: bytes):
-        """Set the displayable A..Z computer ID for a client.
+        """Handle NET_COMPUTERID_ID: the client announces its id.
 
         TR4W sends the ID as a small integer (1 for A, 2 for B, ...) — see
         uNet.pas:662 `ComputerNetID.ciComputerID := Char(Ord(ComputerID) -
@@ -1380,11 +1525,51 @@ class TR4WServer:
         display shows 'A', not '\\x01'."""
         if len(data) < 3:
             return
-        n = data[2]
-        letter = chr(ord('A') + n - 1) if 1 <= n <= 26 else f"?{n}"
+        self._claim_computer_id(client_socket, data[2])
+
+    def _claim_computer_id(self, client_socket: socket.socket, n: int) -> bool:
+        """May this station have computer id `n` (1..26)? True when it was
+        recorded; False when refused, in which case the station has been told
+        (SM_COMPUTERID_IN_USE) and is left UNIDENTIFIED but connected — the
+        client latches on that message and drops itself, which is also what
+        lets it say something useful to the operator. Same rule as the
+        Delphi server's SetComputerID:
+
+        - first come, first served: the station already holding the id is
+          operating, the one that just arrived is not;
+        - only CONNECTED stations count, and the asking station's own entry
+          is excluded, so a station that re-announces the id it already
+          holds (or reclaims it after a reconnect) never refuses itself;
+        - an id outside 1..26 would index a client's 26-row station table
+          out of range, so it is refused before uniqueness is asked."""
+        refusal = None
         with self.clients_lock:
-            if client_socket in self.clients:
-                self.clients[client_socket].computer_id = letter
+            entry = self.clients.get(client_socket)
+            if entry is None:
+                return False
+            if not 1 <= n <= 26:
+                refusal = 'not a letter A..Z'
+            else:
+                letter = chr(ord('A') + n - 1)
+                for other_socket, other in self.clients.items():
+                    if other_socket is not client_socket and other.computer_id == letter:
+                        refusal = f'already held by {other.ip_address}'
+                        break
+            if refusal is None:
+                entry.computer_id = letter
+                peer = entry.ip_address
+        if refusal is not None:
+            msg = TServerMessage(
+                sm_id=NET_SERVERMESSAGE_ID,
+                sm_message=SM_COMPUTERID_IN_USE_MESSAGE,
+                sm_param=n
+            )
+            if self._safe_sendall(client_socket, msg.pack()):
+                self.bytes_sent += 8
+            logger.warning(f"Refused computer ID {n} ({refusal}); station left unidentified")
+            return False
+        logger.debug(f"Computer ID {letter} accepted for {peer}")
+        return True
 
     def _update_station_state(self, sender: socket.socket, data: bytes):
         """Parse a TStationState broadcast and update the sender's live state.
@@ -1409,10 +1594,12 @@ class TR4WServer:
 
             if ss_type == SST_COMPUTER_NAME_AND_ID:
                 entry.name = _cstring(data[25:34])
-                # ssComputerID is the raw small-int form; convert to A..Z.
-                n = data[4]
-                if 1 <= n <= 26:
-                    entry.computer_id = chr(ord('A') + n - 1)
+                # The computer id is NOT taken from here. It is claimed by
+                # NET_COMPUTERID_ID, which is where a duplicate is refused; a
+                # refused station goes on to send its statuses before it has
+                # read the refusal, and taking the id from them would hand it
+                # the id it was just refused (and, when it then drops, clear
+                # the legitimate holder's row on every client).
 
             elif ss_type == SST_BAND_MODE_FREQ:
                 entry.band = data[5]
@@ -1641,11 +1828,17 @@ class TR4WServer:
                 return False
 
     def send_disconnect_message(self, computer_id: str):
-        """Notify all clients that a station disconnected"""
+        """Notify all clients that a station disconnected.
+
+        The parameter is the station's ORDINAL, 1..26 (A=1), the same form
+        the client announced it in. It is not the ASCII letter: a client
+        range-checks the value against 1..26 before it clears that station's
+        row, so a letter (65..90) is silently ignored and the row of a
+        station that left never clears."""
         msg = TServerMessage(
             sm_id=NET_SERVERMESSAGE_ID,
             sm_message=SM_DISCONECT_CLIENT_MESSAGE,
-            sm_param=ord(computer_id) if computer_id else 0
+            sm_param=_computer_id_ordinal(computer_id)
         )
         data = msg.pack()
 

@@ -15,7 +15,23 @@
 
 ### Unreleased — NY4I
 
-Logging improvements. **No wire-protocol or on-disk-format changes** — interoperability with unmodified TR4W clients is unaffected.
+#### Network protocol 2: HELLO first (`tr4wserver.py`, `CLAUDE.md`, `README.md`)
+
+**Wire-protocol change. This server now speaks only TR4W 5.x ("network protocol 2"); a 4.x (Delphi 7) station never joins a 5.x network.** The tag `d7-protocol` is the last server that spoke the 4.x wire (98-byte DX spot, letter-coded disconnect, COMPUTERID first, no duplicate-id refusal).
+
+- **`NET_HELLO_ID` (1150), 70 bytes, must be the first message after the password**: protocol version (2), computer id, program version (16) and contest id (48). Anything else first is logged (`first message was not HELLO ... a 4.x client?`) and the connection is dropped. A HELLO naming another protocol gets `SM_PROTOCOL_MISMATCH` (8330, parameter = this server's protocol) and is dropped.
+- **The server answers a first HELLO with its own** (computer id 0), stores each accepted HELLO per client, sends a newcomer every other station's, and relays a station's HELLO (including a contest change) to the rest. It never judges a contest.
+- The computer id is claimed by the HELLO, with the same first-come-first-served refusal as below. It is no longer taken from `TStationState`.
+
+#### Parity with the Delphi `tr4wserver` (`tr4wserver.py`)
+
+- **`NET_NETWORKDXSPOT_ID` is 106 bytes (was 98).** TR4W's `TSpotRecord.FSysTime` became an 8-byte `TDateTime` on 2026-08-25, making the spot 106; this server kept framing 98, so the first cluster spot a connected TR4W sent desynchronised the stream and the client was dropped (measured 2026-10-27 with `tools/netprobe`).
+- **`SM_DISCONECT_CLIENT` carries the station's ordinal 1..26** (A=1), as the client announced it, instead of the ASCII letter (65..90). A client ignores anything outside 1..26, so the row of a station that left never cleared.
+- **A duplicate computer id is refused** with `SM_COMPUTERID_IN_USE` (8320, parameter = the refused id), exactly as the Delphi server does: first come first served, the asking station's own entry and stations that have disconnected do not count, an id outside 1..26 is refused. The refused station is left connected but unidentified (the client drops itself).
+
+#### Logging improvements
+
+The logging improvements below carry **no wire-protocol or on-disk-format changes.**
 
 #### Custom TRACE level + structured message logging (`tr4wserver.py`, `CLAUDE.md`)
 

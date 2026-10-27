@@ -8,6 +8,8 @@ A Python port of the Delphi `TR4WSERVER` — the network multi-station server fo
 
 The wire protocol and on-disk log file format are dictated by the existing TR4W Delphi clients. **This server is a protocol-compatible reimplementation, not a redesign.** Any change that alters byte layout, field offsets, or message sizing will break interoperability with unmodified TR4W clients in the field.
 
+**This server speaks network protocol 2 (TR4W 5.x), and only that.** The first message after the password must be a `NET_HELLO_ID` (see *Network protocol 2* below); a D7 (4.x) station sends `NET_COMPUTERID_ID` first and is refused and dropped — a 4.x station never joins a 5.x network. **The git tag `d7-protocol` is the last server that spoke the D7 wire** (98-byte DX spot, letter-coded disconnect, no HELLO, no duplicate-id refusal); check it out to serve a 4.x network.
+
 ## Source-of-truth: the Delphi project
 
 The protocol and record layouts live in the Delphi sources at:
@@ -53,7 +55,7 @@ All sizes below are derived from the current `VC.pas` and `tr4wserver.cfg`, trea
 |--------------------------|-----:|-------------------------------|
 | `NET_MESSAGESTATE_ID`    |   64 | `TMessageState` (packed): 2+2+1+59 |
 | `NET_STATIONSTATUS_ID`   |   46 | `TStationState` (packed): 2+2+1+1+1+1+4+13+9+1+11. Was 35 before commit `6708783` added `ssOperator: OperatorType` (Issue #770, 2026-04-17). |
-| `NET_NETWORKDXSPOT_ID`   |   98 | `TNetDXSpot` (packed): 2 + `SizeOf(TSpotRecord)`=96. `TSpotRecord` is a non-packed `record` and pads to 96 under `{$A8}`. |
+| `NET_NETWORKDXSPOT_ID`   |  106 | `TNetDXSpot` (packed): 2 + `SizeOf(TSpotRecord)`=104. `TSpotRecord` is a non-packed `record` that pads to 104 (its `FSysTime` became an 8-byte `TDateTime` in TR4W commit `b285baf7`, 2026-08-25; it was 96, so the spot was 98). This server kept 98 until 2026-10-27 and dropped any client that sent a spot. |
 | `NET_TIMESYN_ID`         |   20 | `TNetTimeSync` (packed): 2 + 16 (`SYSTEMTIME`) + 1 + 1 |
 | `NET_PARAMETER_ID`       |  514 | `TParameterToNetwork` (packed): 2 + 256 + 256 (`ShortString` = length byte + 255 chars) |
 | `NET_INTERCOMMESSAGE_ID` |   84 | `TIntercomMessage` (packed): 2 + 1 + 81 (`Str80` = length byte + 80 chars) |
@@ -64,6 +66,19 @@ All sizes below are derived from the current `VC.pas` and `tr4wserver.cfg`, trea
 | `NET_SPOTVIANETWORK_ID`  |   48 | `TSendSpotViaNetwork` (packed): 2 + 46 |
 | `NET_COMPUTERID_ID`      |    4 | `TComputerNetID` (packed): 2 + 1 + 1 |
 | `NET_SERVERMESSAGE_ID`   |    8 | `TServerMessage` (packed): 2 + 2 + 4 |
+| `NET_HELLO_ID` (1150)    |   70 | `THelloMessage` (packed, `uNetHello.pas`): 2 (id) + 2 (protocol) + 1 (computer id, 0 = the server's own) + 1 (reserved) + 16 (program version) + 48 (contest id), the two text fields NUL padded. `HELLO_STRUCT = '<HHBB16s48s'`. |
+
+The sizes are checked from outside by `tools/netprobe/netprobe.py` in the TR4W repository (`python tools/netprobe/netprobe.py --port <port>`), an independent client with its own table; run it against this server after any change here. TR4W's `tr4w/test/unit/uTestNetWireSizes.pas` pins what the TR4W tree sends — when it fails, this table is what has to follow.
+
+## Network protocol 2 (2026-10-27)
+
+- **`NET_HELLO_ID` is the first message.** `process_buffer` calls `_require_hello` for every other message (and the 4-byte `NET_LOGINFO_MESSAGE` sentinel) until the connection has sent one; a violation raises `ProtocolViolationError`, which `handle_client` logs and turns into a dropped connection (`first message was not HELLO ... a 4.x client?`).
+- **The two protocol versions must be equal** (`NET_PROTOCOL_VERSION = 2`). A HELLO naming another gets `SM_PROTOCOL_MISMATCH_MESSAGE` (8330, `sm_param` = this server's protocol) and the connection is dropped. The client turns that into a message saying which end to update.
+- **`_accept_hello` order is deliberate and mirrors the Delphi server's `AcceptHello`:** judge the protocol; send this server's own HELLO (computer id 0, `SERVER_HELLO_VERSION`, no contest) on the first one; judge the computer id (`_claim_computer_id`, the same first-come-first-served rule `NET_COMPUTERID_ID` uses); only then store the HELLO (`ClientEntry.hello`), send every other station's stored HELLO to a newcomer, and relay this one to the others. A station refused for its id is therefore never announced.
+- **The server never judges a contest.** It stores the 70 bytes and relays them; stations agree on a contest by the id string in the HELLO, and a contest change is just another HELLO. (Contest ids are printable ASCII, 48 characters at most.)
+- **The computer id comes from the HELLO (or a legacy `NET_COMPUTERID_ID`), never from `TStationState`.** A refused station goes on to send its statuses before it has read the refusal; taking the id from them handed it the id it had been refused.
+- `SM_DISCONECT_CLIENT_MESSAGE`'s parameter is the station's **ordinal 1..26**, not the ASCII letter (the client range-checks it and ignores anything else, so the row of a station that left never cleared).
+- `TNetQSOInformation`'s first reserved byte is now `qiSenderID`, the sending station's ordinal. The server relays and stores it untouched.
 
 **`SizeOf(ContestExchange) = 376` bytes** under `{$A8}`. This is the on-disk record size in `SERVERLOG.TRW`. Verified against the deployed `c:\TR4W\tr4w\tr4wserver\SERVERLOG.TRW` (2256 bytes = 6 records). The Python port exposes this as the configurable `LOG RECORD SIZE` INI key (defaulting to 376) and validates it against the existing log file at startup, refusing to run on mismatch — same behavior as Delphi at `tr4wserver.dpr:70`.
 
