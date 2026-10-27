@@ -642,6 +642,13 @@ class TR4WServer:
 
         self.log_file_path = "SERVERLOG.TRW"
         self.log_lock = threading.Lock()
+        # The (ceQSOID1, ceQSOID2) pairs the log holds, so a QSO sent twice
+        # (a station catching up after a lost link, or after a crash) is stored
+        # and relayed once. The log file is the authority: the set was built from
+        # a file of _qso_ids_size bytes and is rebuilt when the file is another
+        # size (cleared, replaced, appended to by someone else).
+        self._qso_ids = set()
+        self._qso_ids_size = -1
 
         self.bytes_received = 0
         self.bytes_sent = 0
@@ -1247,14 +1254,28 @@ class TR4WServer:
                 self.send_confirm_message(client_socket)
 
             elif msg_id == NET_OFFLINEQSO_ID:
-                self.add_qso_to_log(data)
-                self._record_last_qso(client_socket, data, 'offline')
+                # A QSO the log already holds is not stored again, but it is
+                # acknowledged: the sender asked, and is told the server has it.
+                if self.qso_in_log(data):
+                    logger.info("OFFLINEQSO already in the server log - not stored")
+                else:
+                    self.add_qso_to_log(data)
+                    self._record_last_qso(client_socket, data, 'offline')
                 self.send_confirm_message(client_socket)
 
             elif msg_id == NET_QSOINFO_ID:
-                self.broadcast_to_clients(client_socket, data, include_sender=False)
-                self.add_qso_to_log(data)
-                self._record_last_qso(client_socket, data, 'new')
+                # A QSO the log already holds is neither stored nor relayed: it
+                # reached the other stations when it first arrived, and each of
+                # them ignores a second copy anyway. (An edit, above, is always
+                # applied and relayed - it is the same change however often it
+                # is sent.)
+                if self.qso_in_log(data):
+                    logger.info("QSOINFO already in the server log - "
+                                "not stored, not relayed")
+                else:
+                    self.broadcast_to_clients(client_socket, data, include_sender=False)
+                    self.add_qso_to_log(data)
+                    self._record_last_qso(client_socket, data, 'new')
 
             elif msg_id == NET_CLIENTSTATUS_ID:
                 self.update_client_status(client_socket, data)
@@ -1441,6 +1462,51 @@ class TR4WServer:
             logger.warning(f"get_contest_type: {e}")
         return DUMMYCONTEST
 
+    @staticmethod
+    def _qso_key(qso_data: bytes):
+        """(ceQSOID1, ceQSOID2) of a ContestExchange record, or None for the
+        pair (0, 0), which is what a QSO that did not go through the network
+        path carries and so identifies nothing."""
+        id1, id2 = struct.unpack('<II', qso_data[8:16])
+        if id1 == 0 and id2 == 0:
+            return None
+        return (id1, id2)
+
+    def _sync_qso_ids(self):
+        """Rebuild the set of held pairs from the log file unless the file is
+        the size the set was built from. Caller holds log_lock."""
+        size = os.path.getsize(self.log_file_path)
+        if self._qso_ids_size == size:
+            return
+        ids = set()
+        with open(self.log_file_path, 'rb') as f:
+            f.seek(self.log_record_size)  # the header slot
+            while True:
+                record = f.read(self.log_record_size)
+                if len(record) < self.log_record_size:
+                    break
+                key = self._qso_key(record)
+                if key is not None:
+                    ids.add(key)
+        self._qso_ids = ids
+        self._qso_ids_size = size
+
+    def qso_in_log(self, data: bytes) -> bool:
+        """Does the log already hold the QSO in this TNetQSOInformation packet
+        (same ceQSOID1 and ceQSOID2)? A station that was disconnected sends
+        again what it logged meanwhile, and one that crashed sends some twice.
+        False for the pair (0, 0), and when the log cannot be read."""
+        with self.log_lock:
+            try:
+                key = self._qso_key(data[2:2 + self.log_record_size])
+                if key is None:
+                    return False
+                self._sync_qso_ids()
+                return key in self._qso_ids
+            except OSError as e:
+                logger.error(f"Cannot check the log for a duplicate QSO: {e}")
+                return False
+
     def add_qso_to_log(self, data: bytes):
         """Append the embedded ContestExchange to SERVERLOG.TRW.
 
@@ -1449,11 +1515,21 @@ class TR4WServer:
         with self.log_lock:
             try:
                 qso_data = data[2:2 + self.log_record_size]
+                size_before = os.path.getsize(self.log_file_path)
+                set_was_current = (self._qso_ids_size == size_before)
 
                 with open(self.log_file_path, 'ab') as f:
                     f.write(qso_data)
                     f.flush()
                     os.fsync(f.fileno())
+
+                # Keep the set of held pairs in step, but only if it matched the
+                # file before this append; otherwise it is rebuilt when asked.
+                if set_was_current:
+                    key = self._qso_key(qso_data)
+                    if key is not None:
+                        self._qso_ids.add(key)
+                    self._qso_ids_size = os.path.getsize(self.log_file_path)
 
                 self.server_crc32_changed = True
                 logger.info(f"QSO added to log. Total: {self.get_qso_count()}")

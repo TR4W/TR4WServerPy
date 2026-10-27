@@ -23,6 +23,17 @@
 - **The server answers a first HELLO with its own** (computer id 0), stores each accepted HELLO per client, sends a newcomer every other station's, and relays a station's HELLO (including a contest change) to the rest. It never judges a contest.
 - The computer id is claimed by the HELLO, with the same first-come-first-served refusal as below. It is no longer taken from `TStationState`.
 
+#### A QSO sent twice is stored and relayed once (`tr4wserver.py`, `CLAUDE.md`)
+
+A TR4W station that was disconnected sends again what it logged meanwhile, and one that crashed before noting what it had sent sends some of it twice. A QSO is told from another by the pair `(ceQSOID1, ceQSOID2)` (offsets 8 and 12 of the record - the same key `update_qso_in_log` already finds an edit by).
+
+- **`NET_QSOINFO_ID` for a pair the log already holds is neither stored nor relayed.** The first copy reached the other stations; each ignores a second anyway.
+- **`NET_OFFLINEQSO_ID` for a held pair is not stored but is still acknowledged** (`SM_RECEIVED_UPDATED_QSO`), so the sender is told the server has it. An OFFLINEQSO is still never relayed; the TR4W client now resends offline work as QSOINFO so the other stations get it.
+- **`NET_EDITEDQSO_ID` is unchanged**: always applied and relayed, the same change however often it is sent.
+- **The pair (0, 0) identifies nothing** (it is what a QSO that did not go through the network path carries) and is stored and relayed every time, as before.
+- The set of held pairs is built from `SERVERLOG.TRW` the first time it is asked and kept in step by the server's own appends. **The file is the authority**: the set remembers the size of the file it was built from and is rebuilt when the file is another size (cleared, replaced).
+- Checked with `tools/netprobe` `--case resend` in the TR4W repository (a QSO, again as QSOINFO and as OFFLINEQSO, an unseen OFFLINEQSO, two (0, 0) QSOs, an edit, and a burst of 30 or 200 sent twice).
+
 #### Parity with the Delphi `tr4wserver` (`tr4wserver.py`)
 
 - **`NET_NETWORKDXSPOT_ID` is 106 bytes (was 98).** TR4W's `TSpotRecord.FSysTime` became an 8-byte `TDateTime` on 2026-08-25, making the spot 106; this server kept framing 98, so the first cluster spot a connected TR4W sent desynchronised the stream and the client was dropped (measured 2026-10-27 with `tools/netprobe`).
