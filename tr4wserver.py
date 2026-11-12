@@ -632,6 +632,15 @@ class TR4WServer:
         self._web_httpd: Optional[ThreadingHTTPServer] = None
         self._web_thread: Optional[threading.Thread] = None
 
+        # Optional Tailcat transport, so a station on another network can
+        # connect by pasting one address (see tailcat_transport.py). Off unless
+        # TAILCAT = 1 in the INI or --tailcat on the command line. An empty
+        # library / key-file path means "beside the program".
+        self.tailcat_enabled = False
+        self.tailcat_library = ''
+        self.tailcat_key_file = ''
+        self._tailcat = None  # tailcat_transport.TailcatTransport once started
+
         self.clients: Dict[socket.socket, ClientEntry] = {}
         self.clients_lock = threading.Lock()
 
@@ -700,6 +709,9 @@ class TR4WServer:
             self.web_port = config.getint(section, 'WEB PORT', fallback=0)
             self.trace_rx = config.getint(section, 'TRACE RX', fallback=0) == 1
             self.trace_tx = config.getint(section, 'TRACE TX', fallback=0) == 1
+            self.tailcat_enabled = config.getint(section, 'TAILCAT', fallback=0) == 1
+            self.tailcat_library = config.get(section, 'TAILCAT LIBRARY', fallback='').strip()
+            self.tailcat_key_file = config.get(section, 'TAILCAT KEY FILE', fallback='').strip()
 
             level_name = config.get(section, 'LOG LEVEL', fallback=DEFAULT_LOG_LEVEL)
             level = _resolve_log_level(level_name)
@@ -730,6 +742,9 @@ class TR4WServer:
             'LOG LEVEL': logging.getLevelName(self.log_level),
             'TRACE RX': '1' if self.trace_rx else '0',
             'TRACE TX': '1' if self.trace_tx else '0',
+            'TAILCAT': '1' if self.tailcat_enabled else '0',
+            'TAILCAT LIBRARY': self.tailcat_library,
+            'TAILCAT KEY FILE': self.tailcat_key_file,
         }
         with open(self.config_file, 'w') as f:
             config.write(f)
@@ -858,6 +873,47 @@ class TR4WServer:
         if self.web_port:
             self._start_web_server(self.web_port)
 
+        if self.tailcat_enabled:
+            self._start_tailcat()
+
+    def _start_tailcat(self):
+        """Bring up the optional Tailcat transport. Never fatal: the LAN ports
+        are the real service, and a missing library or a network that is not
+        up yet is reported by the transport and leaves them untouched.
+
+        The transport listens on the SAME two port numbers inside the tunnel,
+        because a TR4W client finds the sync port by adding one to the main
+        port and that rule must hold over either road."""
+        try:
+            import tailcat_transport
+        except ImportError as e:
+            logger.error(f"tailcat: tailcat_transport.py is missing ({e}); "
+                         f"remote stations cannot connect")
+            return
+        program_dir = os.path.dirname(os.path.abspath(__file__))
+        library = self.tailcat_library or tailcat_transport.default_library_path(program_dir)
+        key_file = self.tailcat_key_file or os.path.join(
+            program_dir, tailcat_transport.KEY_FILE_NAME)
+        self._tailcat = tailcat_transport.TailcatTransport(
+            library, key_file,
+            {
+                self.port:     lambda s, addr: self.handle_new_client(s, addr, hostname='tailcat'),
+                self.port + 1: self.handle_sync_client,
+            },
+        )
+        logger.info(f"tailcat: starting (library {library})")
+        self._tailcat.start()
+
+    def tailcat_state(self) -> str:
+        """One word for the status displays: off / starting / ready / failed."""
+        return self._tailcat.state if self._tailcat is not None else 'off'
+
+    def tailcat_address(self) -> str:
+        """The address remote stations paste into TR4W, or '' when there is
+        none. IT IS A PASSWORD: print it only where the operator asked for it,
+        never to the log and never on the web status page."""
+        return self._tailcat.address if self._tailcat is not None else ''
+
     def _start_web_server(self, port: int):
         """Bring up the optional read-only HTTP status page on 0.0.0.0:port.
         Failure to bind is logged but non-fatal — the main message bus is
@@ -951,8 +1007,13 @@ class TR4WServer:
                     logger.error(f"Sync accept error: {e}")
                     time.sleep(0.5)
 
-    def handle_new_client(self, client_socket: socket.socket, addr: Tuple[str, int]):
+    def handle_new_client(self, client_socket: socket.socket, addr: Tuple[str, int],
+                          hostname: Optional[str] = None):
         """Authenticate a new client and hand it to handle_client.
+
+        `hostname` is given by a transport that already knows what to call the
+        peer (Tailcat: its address is not in any DNS), and skips the reverse
+        lookup.
 
         Authentication uses a short, separate timeout — we don't want a hung
         TCP-handshake-only attacker to occupy a client slot for 5 minutes.
@@ -991,11 +1052,17 @@ class TR4WServer:
                 return
 
             # Switch to operational timeouts (long recv, modest send).
-            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                # Not a TCP socket: a Tailcat connection arrives as one end of
+                # a socket pair, which has no Nagle delay to switch off.
+                pass
             client_socket.settimeout(SOCKET_RECV_TIMEOUT)
             self._set_send_timeout(client_socket, SOCKET_SEND_TIMEOUT)
 
-            hostname = self._reverse_dns(addr[0])
+            if hostname is None:
+                hostname = self._reverse_dns(addr[0])
 
             with self.clients_lock:
                 if len(self.clients) >= MAX_CLIENTS:
@@ -1125,10 +1192,7 @@ class TR4WServer:
         # Resolve the peer once per connection (cheap, one syscall) so it's
         # available for both the DEBUG per-message line and the optional
         # TRACE RX dump, regardless of whether tracing is on.
-        try:
-            peer = client_socket.getpeername()[0]
-        except OSError:
-            peer = '?'
+        peer = self._peer_name(client_socket)
 
         while self.running:
             try:
@@ -1380,6 +1444,25 @@ class TR4WServer:
         for s in dead:
             self.remove_client(s)
 
+    def _peer_name(self, sock: socket.socket) -> str:
+        """What to call the far end of `sock` in a log line. Never raises.
+
+        A registered client is named by its entry, which is the only source
+        that is right for every transport: a Tailcat connection is one end of
+        a socket pair, and asking that for its peer yields an empty string,
+        not an address. No lock is taken (a single dict lookup; callers may
+        already hold clients_lock)."""
+        entry = self.clients.get(sock)
+        if entry is not None and entry.ip_address:
+            return entry.ip_address
+        try:
+            name = sock.getpeername()
+        except OSError:
+            return '?'
+        if isinstance(name, tuple) and name:
+            return str(name[0])
+        return '?'
+
     def _trace_bytes(self, direction: str, sock: socket.socket, data: bytes):
         """Dump raw bytes at TRACE level for TRACE RX / TRACE TX.
 
@@ -1388,10 +1471,7 @@ class TR4WServer:
         socket down) and never raises. Only the first 64 bytes are shown — a
         full QSO record is 384 bytes and dumping all of it per message would
         bury the log."""
-        try:
-            peer = sock.getpeername()[0]
-        except OSError:
-            peer = '?'
+        peer = self._peer_name(sock)
         preview = data[:64].hex(' ')
         suffix = ' ...' if len(data) > 64 else ''
         logger.trace(f"{direction}[{peer}] {len(data)}B {preview}{suffix}")
@@ -1968,6 +2048,9 @@ class TR4WServer:
 
         self._stop_web_server()
 
+        if self._tailcat is not None:
+            self._tailcat.stop()
+
         try:
             self._resolver.shutdown(wait=False)
         except Exception:
@@ -2017,6 +2100,7 @@ class TR4WServer:
             'rx':       self.bytes_received,
             'tx':       self.bytes_sent,
             'clients':  clients,
+            'tailcat':  self.tailcat_state(),  # the state only, never the address
             'last_qso': self.last_qso,  # already an immutable dict or None
         }
 
@@ -2049,7 +2133,8 @@ class TR4WServer:
         rows = [
             f"{SERVER_VERSION}  port {snap['port']}  "
             f"clients {len(snap['clients'])}/{MAX_CLIENTS}  "
-            f"qsos {snap['qsos']}  rx {snap['rx']:,}  tx {snap['tx']:,}",
+            f"qsos {snap['qsos']}  rx {snap['rx']:,}  tx {snap['tx']:,}"
+            f"  tailcat {snap.get('tailcat', 'off')}",
             last_line,
             "-" * len(header),
             header,
@@ -2154,6 +2239,13 @@ def main():
                              'TCP port, in addition to the journalctl output. '
                              'Overrides the WEB PORT INI key. No auth — '
                              'intended for a closed multi-op LAN.')
+    parser.add_argument('--tailcat', action='store_true',
+                        help='Also accept stations from other networks through '
+                             'Tailcat (overrides the TAILCAT INI key). Needs '
+                             'libtailcat beside the program or named by '
+                             'TAILCAT LIBRARY. The address to hand out is '
+                             'written to tailcat.address and printed by the '
+                             "'a' console command; treat it as a password.")
     args = parser.parse_args()
 
     if args.log_file:
@@ -2192,6 +2284,8 @@ def main():
         server.trace_tx = True
     if args.web_port is not None:
         server.web_port = args.web_port
+    if args.tailcat:
+        server.tailcat_enabled = True
 
     # Either trace toggle forces TRACE verbosity so the raw dumps actually
     # appear — turning on the flag is the whole knob (it overrides LOG LEVEL).
@@ -2216,7 +2310,7 @@ def main():
         sys.exit(1)
 
     print("\nTR4WSERVER running. Press Ctrl+C to stop.\n")
-    print("Commands: 's' = status, 'q' = quit\n")
+    print("Commands: 's' = status, 'a' = show the Tailcat address, 'q' = quit\n")
 
     if args.display and sys.stdout.isatty():
         # Display thread reads state with light locks; safe to leave as a
@@ -2234,6 +2328,14 @@ def main():
                     break
                 elif cmd == 's':
                     server.print_status()
+                elif cmd == 'a':
+                    # stdout only, and only because the operator asked: the
+                    # address is a password and must not reach the log.
+                    address = server.tailcat_address()
+                    if address:
+                        print(f"\nTailcat address (a password - share it privately):\n{address}\n")
+                    else:
+                        print(f"\nNo Tailcat address: tailcat is {server.tailcat_state()}.\n")
             except EOFError:
                 # No controlling terminal — sleep on the stop event so SIGTERM
                 # wakes us immediately. Do NOT busy-poll.

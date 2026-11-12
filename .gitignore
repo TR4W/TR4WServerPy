@@ -3,6 +3,13 @@ SERVERLOG.TRW
 # Per-developer runtime config. *.ini is ignored so a local tr4wserver.ini is
 # never clobbered by git; the tracked template is tr4wserver.ini.sample.
 *.ini
+# Tailcat transport: the key and the address are SECRETS, and the library is a
+# 30 MB build product (see README, "Stations on another network").
+tailcat.key.json
+tailcat.key.json.new
+tailcat.address
+tailcat.address.new
+libtailcat.*
 *.pyc
 __pycache__/
 

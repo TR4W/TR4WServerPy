@@ -70,7 +70,7 @@ lines (the installer only patches the path on its first run).
 ```
 python3 tr4wserver.py [-h] [-c CONFIG] [-p PORT] [--password PASSWORD]
                       [--display] [--trace-rx] [--trace-tx] [--log-file PATH]
-                      [--web-port PORT]
+                      [--web-port PORT] [--tailcat]
 ```
 
 | Flag | Purpose |
@@ -83,9 +83,11 @@ python3 tr4wserver.py [-h] [-c CONFIG] [-p PORT] [--password PASSWORD]
 | `--trace-tx` | Same as `--trace-rx` but for transmitted data — dumps every chunk sent to clients (broadcasts, replies, sync transfer). Overrides the `TRACE TX` INI key and forces TRACE level. |
 | `--log-file PATH` | Append all log output to `PATH` in addition to stderr/journalctl. Useful for capturing a `--trace-rx`/`--trace-tx` session for later analysis without losing the live view. |
 | `--web-port PORT` | Serve a read-only HTML status page on `0.0.0.0:PORT`, in addition to the normal stdout/journalctl logging. Page auto-refreshes every 2 seconds. No auth — intended for a closed multi-op LAN. Overrides the `WEB PORT` INI key. |
+| `--tailcat` | Also accept stations from other networks through Tailcat. Overrides the `TAILCAT` INI key. See [Stations on another network (Tailcat)](#stations-on-another-network-tailcat). |
 
 The `s` interactive command produces the same per-station table as `--display`,
-just as a one-shot snapshot instead of refreshing.
+just as a one-shot snapshot instead of refreshing. The `a` command prints the
+Tailcat address (see below); it is a password, so it goes to the terminal only.
 
 ---
 
@@ -116,6 +118,9 @@ WEB PORT = 0
 LOG LEVEL = INFO
 TRACE RX = 0
 TRACE TX = 0
+TAILCAT = 0
+TAILCAT LIBRARY =
+TAILCAT KEY FILE =
 ```
 
 | Key | Default | What it does |
@@ -129,6 +134,70 @@ TRACE TX = 0
 | `LOG LEVEL` | `INFO` | Logging verbosity. One of `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive). An unrecognized value logs a warning and falls back to `INFO`. `DEBUG` adds one line per inbound message (id + sender). `TRACE` is the most verbose tier (raw byte dumps + per-request web logs). Note: this gates the **whole** log stream, so `WARNING` or above also hides the INFO startup banner (Server IP, listening ports). |
 | `TRACE RX` | `0` (off) | When `1`, dump every received `recv()` chunk in hex plus each framed message ID, at TRACE level. **Protocol-debug only**, very verbose. Enabling it forces the effective log level to TRACE so the dumps appear regardless of `LOG LEVEL`. Overridable with `--trace-rx`. |
 | `TRACE TX` | `0` (off) | Same as `TRACE RX` but for transmitted data — every chunk sent to clients (broadcasts, replies, sync transfer). Forces TRACE level. Overridable with `--trace-tx`. |
+| `TAILCAT` | `0` (off) | When `1`, also accept stations from other networks through Tailcat. Overridable with `--tailcat`. |
+| `TAILCAT LIBRARY` | empty | Path to `libtailcat.so` (`.dylib` on macOS, `libtailcat.dll` on Windows). Empty means "beside `tr4wserver.py`". |
+| `TAILCAT KEY FILE` | empty | Where the server's Tailcat key is kept. Empty means `tailcat.key.json` beside `tr4wserver.py`. The address is written next to it as `tailcat.address`. |
+
+### Stations on another network (Tailcat)
+
+[Tailcat](https://github.com/tailscale/tailcat) carries a TCP connection over
+WireGuard, gets through home routers by itself, and needs no account. With it a
+TR4W station anywhere can join this server by pasting **one string** into TR4W;
+nothing has to be forwarded in a router. Stations on the LAN keep connecting
+exactly as before, at the same time.
+
+**What you need:** the Tailcat C library, `libtailcat.so`, beside
+`tr4wserver.py`. It is not a Python package and this server still has no
+third-party Python dependency. Build it once on a machine with Go and a C
+compiler, from the Tailcat repository:
+
+```sh
+CGO_ENABLED=1 go build -buildmode=c-shared -o libtailcat.so ./cmd/libtailcat
+```
+
+**Turn it on:** set `TAILCAT = 1` in the INI (or start with `--tailcat`) and
+restart. The log shows `tailcat: ready on ports 1061, 1062 ...`. If the
+library is missing the log says so and the server carries on serving the LAN.
+If the network is not up yet it tries again every 30 seconds.
+
+**Get the address to hand out:** it is in the file `tailcat.address` beside the
+key file (readable by the server's account only), and the `a` console command
+prints it. It is deliberately **not** in the log or on the web status page.
+
+```sh
+cat ~/tr4wserverpy/tailcat.address
+```
+
+**The address is a password.** It contains a WireGuard pre-shared key, and
+anyone who holds it can reach the server's two ports (they still need the
+`SERVER PASSWORD`, which is a weak second check - change it from the default).
+Send it privately.
+
+**It stays the same across restarts.** The key, the pre-shared key and the
+relay the address names are saved in `tailcat.key.json`, so an address you
+handed out keeps working.
+
+**To withdraw every address ever handed out:** stop the server, delete
+`tailcat.key.json`, start it again. A new key means a new address, and the old
+one is dead. Stations already connected are dropped by the restart.
+
+**What a remote station sets in TR4W:** the address, and the same port number
+(`1061` by default) the server uses. The sync port is the main port plus one
+over the tunnel as well.
+
+**In the client list** a Tailcat station appears as `tc:xxxx:xxxx` with the
+host name `tailcat`: the last part of its address inside the tunnel, which is
+distinct per station.
+
+**Relays.** Stations first meet through one of Tailscale's free relays and
+then normally switch to a direct path. Those relays carry no uptime promise.
+For a setup that must not depend on them, run your own relay (`derper`) and
+see the Tailcat README, "Bring your own DERP relay".
+
+**Testing without TR4W support:** the stock `tailcat` program can stand in
+for either end. On a station, `tailcat forward <address> 1061 1062` and point
+TR4W at `127.0.0.1`. (Instead of `TAILCAT = 1`, the server machine can also
+simply run `tailcat serve 1061,1062` beside an unmodified server.)
 
 ### Changing the password
 
@@ -201,8 +270,10 @@ addition.
 | `tr4wserver.ini` | Server configuration. Created with defaults if missing. |
 | `tr4wserver.log` | Not used by this Python port — the Delphi server writes one, but here all logging goes to stdout (and therefore systemd's journal). |
 
-Both `SERVERLOG.TRW` and `tr4wserver.ini` are gitignored so they're never
-committed.
+| `tailcat.key.json` | Only with `TAILCAT = 1`. The server's Tailcat key, pre-shared key and relay. **Secret.** Deleting it changes the address. |
+| `tailcat.address` | Only with `TAILCAT = 1`. The address to give remote stations. **Secret.** Rewritten at each start. |
+
+All of these are gitignored so they're never committed.
 
 ---
 

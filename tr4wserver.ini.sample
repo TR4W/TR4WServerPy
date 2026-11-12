@@ -53,3 +53,18 @@ LOG LEVEL = INFO
 #   TRACE TX = dump every chunk sent to clients
 TRACE RX = 0
 TRACE TX = 0
+
+# 1 = also accept stations from OTHER networks through Tailcat (no router
+# changes, no account). Needs libtailcat beside tr4wserver.py; see README.md,
+# "Stations on another network (Tailcat)". 0 = off.
+# The address to hand to remote stations is written to tailcat.address beside
+# the key file. IT IS A PASSWORD: it is never written to the log.
+TAILCAT = 0
+
+# Path to the Tailcat library. Empty = libtailcat.so beside tr4wserver.py.
+TAILCAT LIBRARY =
+
+# Where the server's Tailcat key is kept. Empty = tailcat.key.json beside
+# tr4wserver.py. Delete that file to change the address and so withdraw every
+# address handed out before.
+TAILCAT KEY FILE =

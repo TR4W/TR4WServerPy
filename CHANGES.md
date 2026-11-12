@@ -15,6 +15,16 @@
 
 ### Unreleased — NY4I
 
+#### Optional Tailcat transport: stations on another network (`tailcat_transport.py`, `tr4wserver.py`, `README.md`)
+
+TR4W issue 293. With `TAILCAT = 1` (or `--tailcat`) the server also listens inside a [Tailcat](https://github.com/tailscale/tailcat) tunnel, so a station on another network joins by pasting one address. Off by default; the LAN ports are unchanged and serve at the same time.
+
+- **New module `tailcat_transport.py`**: a `ctypes` binding to the Tailcat C library (`libtailcat`, ABI 1) and a transport that joins each tunnel connection to the existing `handle_new_client` / `handle_sync_client` through a `socket.socketpair()`. The protocol code is not forked and no new local listener is opened. Still no third-party Python dependency.
+- **The address is a password and is never logged.** It is written to `tailcat.address` (mode 0600) and printed by the new `a` console command. The web status page shows only the state (`off` / `starting` / `ready` / `failed`).
+- **The address survives a restart**: key, pre-shared key and relay region are saved in `tailcat.key.json`. Deleting that file is how every address handed out is withdrawn.
+- **A missing library or a network that is not up is not fatal**: the first is reported once, the second retried every 30 s.
+- `handle_new_client` takes an optional `hostname` and no longer assumes a TCP socket (`TCP_NODELAY` on a socket pair is refused); log lines name a client through the new `_peer_name`, because a socket pair has no peer address.
+
 #### Network protocol 2: HELLO first (`tr4wserver.py`, `CLAUDE.md`, `README.md`)
 
 **Wire-protocol change. This server now speaks only TR4W 5.x ("network protocol 2"); a 4.x (Delphi 7) station never joins a 5.x network.** The tag `d7-protocol` is the last server that spoke the 4.x wire (98-byte DX spot, letter-coded disconnect, COMPUTERID first, no duplicate-id refusal).

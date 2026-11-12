@@ -35,6 +35,17 @@ Runtime artifacts (`SERVERLOG.TRW`, `tr4wserver.ini`) are gitignored (`*.ini` an
 
 **Config resolution** (`resolve_config_path` in `tr4wserver.py`): an explicit `-c/--config` path wins outright; otherwise the server searches most-specific-first — `<program dir>/tr4wserver.ini`, then `~/.config/tr4wserver.ini` — mirroring `git config` precedence. The first that exists is used; if neither exists the default is created in the **program directory** (the script's own directory, via `__file__`, not necessarily CWD). `SERVERLOG.TRW` is still created relative to CWD; under the shipped systemd unit (`WorkingDirectory` = program dir) the two coincide.
 
+## Optional Tailcat transport (`tailcat_transport.py`, TR4W issue 293)
+
+Off unless `TAILCAT = 1` / `--tailcat`. A second module, deliberately: `tr4wserver.py` stays the protocol, `tailcat_transport.py` is a `ctypes` binding to the Tailcat C library (`libtailcat`, ABI 1, built from `cmd/libtailcat` in tailscale/tailcat; the header `tailcat.h` there is the source of truth for every signature) plus a transport that listens on `PORT` and `PORT + 1` **inside the tunnel**.
+
+- **One protocol implementation.** Each tunnel connection is joined to one end of a `socket.socketpair()` and the other end is handed to the SAME `handle_new_client` / `handle_sync_client` a LAN connection gets. Do not add a second handler, and do not replace the socket pair with a loopback listener (that would open a port any local process could reach).
+- **A handler's socket is therefore not always TCP.** On Linux a socket pair is `AF_UNIX`: `TCP_NODELAY` is refused and `getpeername()` returns an empty string, not a tuple. Name a client with `_peer_name`, never `getpeername()[0]`.
+- **The address is a password.** It must never reach the log, an exception message, the web status page or a test fixture. It goes to `tailcat.address` (0600) and to stdout on the `a` console command, nowhere else.
+- **Address stability is three saved things**: private key, pre-shared key, and the relay `region` exactly as `tc_address_parse` reports it. Dropping any one changes the address every station holds. A key file that exists but cannot be read is an error, never a reason to mint a new key.
+- The library embeds a Go runtime and stays loaded for the life of the process. Every string it returns is released with `tc_free`; handles are closed with `tc_close`, and closing the server closes its whole tree, which is how `stop()` unblocks every accept and read.
+- **Not yet run on Linux/aarch64** (written and tested on Windows x64, 2026-11-12): the `AF_UNIX` path and SIGTERM handling with the Go runtime loaded are the things to check first on the Pi.
+
 ## Architecture
 
 Single file, single class (`TR4WServer` in `tr4wserver.py`). The shape is:
