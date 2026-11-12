@@ -15,6 +15,10 @@
 
 ### Unreleased — NY4I
 
+#### Network protocol 3 (`tr4wserver.py`)
+
+`NET_PROTOCOL_VERSION` is 3, to match TR4W from issue 298 (2026-11-12): the QSO record now carries the received year in bytes that were reserved. No size changed and the server neither reads nor alters those bytes; the number moves because the server and a station must name the same protocol, so **a TR4W built before that change is refused by this server, and this server's predecessor refuses a TR4W built after it.** Everything the documents below say about "network protocol 2" (HELLO first, the refusal messages) holds for 3.
+
 #### Optional Tailcat transport: stations on another network (`tailcat_transport.py`, `tr4wserver.py`, `README.md`)
 
 TR4W issue 293. With `TAILCAT = 1` (or `--tailcat`) the server also listens inside a [Tailcat](https://github.com/tailscale/tailcat) tunnel, so a station on another network joins by pasting one address. Off by default; the LAN ports are unchanged and serve at the same time.

@@ -138,7 +138,11 @@ SM_PROTOCOL_MISMATCH_MESSAGE = 8330
 # Network protocol 2 (TR4W 5.x). The first message after the password must be a
 # HELLO; the two versions must be equal. Mirrors uNetHello.pas in the TR4W tree.
 # V1 (no HELLO at all) is what 4.x stations and the `d7-protocol` tag speak.
-NET_PROTOCOL_VERSION = 2
+# 3 (2026-11-12, TR4W issue 298): the QSO record carries the received year in
+# bytes that were reserved. Every size is unchanged and this server stores and
+# relays the record without reading them; the number moves only because the
+# two ends must be equal.
+NET_PROTOCOL_VERSION = 3
 HELLO_STRUCT = struct.Struct('<HHBB16s48s')   # id, protocol, computer id, reserved, version, contest id
 SIZE_OF_HELLO = HELLO_STRUCT.size             # 70
 
