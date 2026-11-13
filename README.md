@@ -226,7 +226,7 @@ defined by `VC.pas` in the TR4W source tree. As long as your clients and this
 server agree on the message record sizes and the `ContestExchange` layout, the
 server doesn't care which TR4W build is connecting.
 
-**This server speaks network protocol 3 (protocol 2 with a received year in the QSO record), which is TR4W 5.x from 2026-11-12.** A 5.x station's
+**This server speaks network protocol 4 (protocol 2 with a received year, protocol 3, and the sender's sent year, protocol 4, in the QSO record), which is TR4W 5.x from 2026-11-13.** A 5.x station's
 first message is a `HELLO` (protocol version, computer id, program version and
 the id of the contest it is running); the server answers with its own, tells a
 newcomer what every other station announced, and relays any change. A TR4W

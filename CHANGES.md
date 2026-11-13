@@ -15,6 +15,10 @@
 
 ### Unreleased — NY4I
 
+#### Network protocol 4 (`tr4wserver.py`)
+
+`NET_PROTOCOL_VERSION` is 4, to match TR4W from issue 300 (2026-11-13): the QSO record now also carries the licence year its SENDER sent (a boolean at byte 327 and a Word at 328, carved from the same reserved bytes), so a peer's row records the year the peer sent. The record is still 376 bytes and the packet 384; the server stores and relays the record whole, reads none of it, and needs no other change. The number moves because the two ends must be equal: **a TR4W built before that change (protocol 3) is refused by this server with `SM_PROTOCOL_MISMATCH` (parameter 4), and a protocol-4 TR4W is refused by a protocol-3 server.** An older `SERVERLOG.TRW` needs no conversion: the bytes it holds there are zero, which reads as "no year".
+
 #### Network protocol 3 (`tr4wserver.py`)
 
 `NET_PROTOCOL_VERSION` is 3, to match TR4W from issue 298 (2026-11-12): the QSO record now carries the received year in bytes that were reserved. No size changed and the server neither reads nor alters those bytes; the number moves because the server and a station must name the same protocol, so **a TR4W built before that change is refused by this server, and this server's predecessor refuses a TR4W built after it.** Everything the documents below say about "network protocol 2" (HELLO first, the refusal messages) holds for 3.

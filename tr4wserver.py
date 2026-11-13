@@ -142,7 +142,11 @@ SM_PROTOCOL_MISMATCH_MESSAGE = 8330
 # bytes that were reserved. Every size is unchanged and this server stores and
 # relays the record without reading them; the number moves only because the
 # two ends must be equal.
-NET_PROTOCOL_VERSION = 3
+# 4 (2026-11-13, TR4W issue 300): the QSO record also carries the year its
+# SENDER sent (YearSentKnown at byte 327, YearSent at 328..329, from the same
+# reserved bytes). Still 376 / 384 bytes, still stored and relayed whole and
+# unread; the number moves because the two ends must be equal.
+NET_PROTOCOL_VERSION = 4
 HELLO_STRUCT = struct.Struct('<HHBB16s48s')   # id, protocol, computer id, reserved, version, contest id
 SIZE_OF_HELLO = HELLO_STRUCT.size             # 70
 
